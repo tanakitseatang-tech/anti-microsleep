@@ -68,6 +68,16 @@
   .rest-msg.show { display: block; }
   .rest-msg.red { background: #2a1215; border-color: var(--alarm); color: #ffb4b4; }
 
+  .ack-box { display: none; margin: 0 0 10px; padding: 10px 12px; border-radius: 14px; background: #13261b;
+             border: 2px solid var(--ok); }
+  .ack-box.show { display: block; }
+  .ack-box.red { background: #2a1215; border-color: var(--alarm); }
+  .ack-title { font-weight: 800; font-size: 15px; margin-bottom: 8px; }
+  .ack-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .ack-btn { min-height: 52px; border-radius: 12px; border: 0; font: inherit; font-size: 16px; font-weight: 800;
+             cursor: pointer; color: #fff; background: var(--ok); }
+  .ack-btn.rest { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+
   .tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
   .tab { padding: 8px 4px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel2);
          color: var(--muted); font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
@@ -134,6 +144,13 @@
     <div class="icon" id="icon">⏳</div>
     <div><div class="big" id="big">กำลังเชื่อมต่อ…</div><div class="why" id="why"></div></div>
   </div>
+  <div class="ack-box" id="ackBox">
+    <div class="ack-title" id="ackTitle">⚠️ มีการแจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว (เพื่อปิดเคสที่บริษัท)</div>
+    <div class="ack-btns">
+      <button class="ack-btn" id="ackAwakeBtn">✅ ฉันตื่นแล้ว</button>
+      <button class="ack-btn rest" id="ackBreakBtn">☕ แวะพักรถแล้ว</button>
+    </div>
+  </div>
   <div class="rest-msg" id="restMsg"></div>
 
   <div class="tabs" role="tablist">
@@ -173,6 +190,11 @@
     </div>
     <ul class="events" id="events"></ul>
     <div class="sub" id="noEvents">ยังไม่มีการเตือนวันนี้ 👍</div>
+    <div class="section-h">ทดสอบระบบแจ้งเตือน (ส่งขึ้นเว็บบริษัท)</div>
+    <div class="row2">
+      <button class="btn" id="testWarnBtn">🟡 ทดสอบเตือน</button>
+      <button class="btn" id="testAlarmBtn">🔴 ทดสอบหลับใน</button>
+    </div>
     <div class="foot"><a href="/">หน้าจอสำหรับช่าง (ภาพกล้อง)</a></div>
   </details>
 </section>
@@ -398,6 +420,14 @@ function render() {
     $("meter").className = breakDue ? "due" : "";
   }
 
+  // driver acknowledgment button bar: shown whenever an alert is waiting for confirmation
+  const needAck = !!d.pending_alert_at || d.level > 0;
+  const ackRed = d.level === 2 || d.pending_level === 2;
+  $("ackBox").className = "ack-box" + (needAck ? " show" : "") + (ackRed ? " red" : "");
+  $("ackTitle").textContent = ackRed
+    ? "🚨 แจ้งเตือนหลับใน! กดยืนยันเมื่อตื่นหรือแวะพักแล้ว (ส่งยืนยันไปที่บริษัท)"
+    : "⚠️ แจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว (เพื่อปิดเคสที่บริษัท)";
+
   // tired -> suggest a rest stop and switch the card to rest areas (unless the driver picked a tab)
   const recent = (sec) => evs.filter(e => d.now - e.t <= sec);
   const red = d.level === 2 || recent(900).some(e => e.level === 2);
@@ -428,6 +458,10 @@ async function post(url, body) {
 $("startBtn").onclick = () => post("/api/shift", { action: "start" });
 $("breakBtn").onclick = () => post("/api/shift", { action: "break" });
 $("endBtn").onclick = () => { if (confirm("จบกะตอนนี้?")) post("/api/shift", { action: "end" }); };
+$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollDriver(); };
+$("ackBreakBtn").onclick = async () => { await post("/api/driver/ack", { kind: "break" }); pollDriver(); };
+$("testWarnBtn").onclick = async () => { await post("/api/driver/test_alert", { level: 1 }); pollDriver(); };
+$("testAlarmBtn").onclick = async () => { await post("/api/driver/test_alert", { level: 2 }); pollDriver(); };
 
 pollDriver();
 pollNav();

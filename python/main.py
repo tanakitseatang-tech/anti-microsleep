@@ -1248,6 +1248,8 @@ class DriverLog:
         self.events = deque(maxlen=EVENTS_KEEP)
         self.shift_start = None
         self.last_break = None
+        self.pending_alert_at = None
+        self.pending_level = 0
         os.makedirs(DATA_DIR, exist_ok=True)
         try:
             with open(EVENTS_FILE) as f:
@@ -1266,14 +1268,31 @@ class DriverLog:
             pass
 
     def add(self, level, reasons):
-        ev = {"t": time.time(), "level": level, "reasons": list(reasons)}
+        now = time.time()
+        ev = {"t": now, "level": level, "reasons": list(reasons)}
+        only_no_face = reasons and all(str(r).startswith("face not visible") for r in reasons)
         with self.lock:
             self.events.append(ev)
+            if not only_no_face:
+                if self.pending_alert_at is None:
+                    self.pending_alert_at = now
+                self.pending_level = max(self.pending_level, int(level))
             try:
                 with open(EVENTS_FILE, "a") as f:
                     f.write(json.dumps(ev) + "\n")
             except Exception as e:
                 logger.warning(f"cannot save event: {e}")
+
+    def ack(self):
+        with self.lock:
+            at = self.pending_alert_at
+            self.pending_alert_at = None
+            self.pending_level = 0
+            for i in range(len(self.events) - 1, -1, -1):
+                if not self.events[i].get("acked"):
+                    self.events[i]["acked"] = True
+                    break
+        return None if at is None else max(1, round(time.time() - at))
 
     def _save_shift(self):
         try:
@@ -1295,7 +1314,8 @@ class DriverLog:
 
     def snapshot(self):
         with self.lock:
-            return list(self.events), self.shift_start, self.last_break
+            return (list(self.events), self.shift_start, self.last_break,
+                    self.pending_alert_at, self.pending_level)
 
 
 driver_log = DriverLog()
@@ -1303,13 +1323,14 @@ TRUCK_ID = _read_truck_id()
 
 
 def _driver_state():
-    events, start, last_break = driver_log.snapshot()
+    events, start, last_break, pending_at, pending_lvl = driver_log.snapshot()
     s = live.stats
     return {
         "truck": TRUCK_ID, "now": time.time(),
         "level": s.get("level_num", 0), "status": s.get("status"),
         "reasons": s.get("reasons", []), "perclos": s.get("perclos"), "yawns": s.get("yawns"),
         "shift_start": start, "last_break": last_break, "break_every_s": BREAK_EVERY_S,
+        "pending_alert_at": pending_at, "pending_level": pending_lvl,
         "events": events[-100:],
     }
 
@@ -1319,12 +1340,44 @@ def _driver_shift(body: dict = Body(...)):
     if action not in ("start", "break", "end"):
         return {"ok": False, "error": "bad action"}
     driver_log.shift(action)
+    if action == "break":
+        sec = driver_log.ack()
+        company_sync.enqueue_ack(
+            f"คนขับกดแวะพักรถแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับกดแวะพักรถแล้ว"
+        )
     logger.info(f"Driver shift: {action}")
+    return {"ok": True}
+
+
+def _driver_ack(body: dict = Body(...)):
+    kind = str(body.get("kind", "awake"))
+    sec = driver_log.ack()
+    if kind == "break":
+        driver_log.shift("break")
+        note = f"คนขับแวะพักรถแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับแวะพักรถแล้ว"
+    else:
+        note = f"คนขับกดยืนยันว่าตื่นแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับกดยืนยันว่าตื่นแล้ว"
+    detector.closed_hist.clear()
+    detector.yawn_times.clear()
+    detector.narrow_since = None
+    company_sync.enqueue_ack(note)
+    logger.info(f"Driver ACK ({kind}): {note}")
+    return {"ok": True, "note": note}
+
+
+def _driver_test_alert(body: dict = Body(...)):
+    lvl = 2 if int(body.get("level", 2)) >= 2 else 1
+    reasons = ["microsleep 2.2s"] if lvl == 2 else ["eyes closed 1.3s"]
+    driver_log.add(lvl, reasons)
+    company_sync.enqueue(lvl, reasons)
+    logger.info(f"Simulated driver alert level={lvl}")
     return {"ok": True}
 
 
 ui.expose_api("GET", "/api/driver", _driver_state)
 ui.expose_api("POST", "/api/shift", _driver_shift)
+ui.expose_api("POST", "/api/driver/ack", _driver_ack)
+ui.expose_api("POST", "/api/driver/test_alert", _driver_test_alert)
 
 
 # --------------------------------------------------------------------------
@@ -1391,6 +1444,7 @@ class CompanySync:
     def __init__(self):
         self.wake_ev = threading.Event()
         self.db_lock = threading.Lock()
+        self.pending_ack_note = None
         self.last_ok = None
         self.last_err = None
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -1403,6 +1457,11 @@ class CompanySync:
 
     def _db(self):
         return sqlite3.connect(COMPANY_QUEUE_DB, timeout=10.0)
+
+    def enqueue_ack(self, note):
+        with self.db_lock:
+            self.pending_ack_note = note
+        self.wake()
 
     def _read_key(self):
         try:
@@ -1474,23 +1533,35 @@ class CompanySync:
             rows = con.execute(
                 "SELECT id, t, level, reasons, lat, lon, speed FROM queue ORDER BY t ASC LIMIT 50"
             ).fetchall()
-        if not rows:
-            return
-        events = [
-            {
-                "id": r[0], "t": round(r[1]), "level": r[2],
-                "reasons": json.loads(r[3] or "[]"),
-                "lat": r[4], "lon": r[5], "speed": r[6],
-            }
-            for r in rows
-        ]
-        try:
-            self._post(f"{base}/api/ingest/event", key, {"events": events})
-            with self.db_lock, self._db() as con:
-                con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
-            logger.info(f"Synced {len(rows)} alert event(s) to company server")
-        except Exception as e:
-            self.last_err = str(e)
+        if rows:
+            events = [
+                {
+                    "id": r[0], "t": round(r[1]), "level": r[2],
+                    "reasons": json.loads(r[3] or "[]"),
+                    "lat": r[4], "lon": r[5], "speed": r[6],
+                }
+                for r in rows
+            ]
+            try:
+                self._post(f"{base}/api/ingest/event", key, {"events": events})
+                with self.db_lock, self._db() as con:
+                    con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
+                logger.info(f"Synced {len(rows)} alert event(s) to company server")
+            except Exception as e:
+                self.last_err = str(e)
+                return
+
+        with self.db_lock:
+            ack_note = self.pending_ack_note
+        if ack_note:
+            try:
+                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note})
+                with self.db_lock:
+                    if self.pending_ack_note == ack_note:
+                        self.pending_ack_note = None
+                logger.info(f"Synced driver ACK to company server: {ack_note}")
+            except Exception as e:
+                self.last_err = str(e)
 
     def start(self):
         def _run():
