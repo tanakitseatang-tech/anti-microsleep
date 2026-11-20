@@ -8,8 +8,6 @@ Pipeline per frame:
              -> MAR  (mouth aspect ratio)  : yawning
              -> brightness / face found    : camera confidence
   => alarm level 0/1/2 + status code, sent to the MCU sketch via Bridge.
-
-Later the MPU6050 + ultrasonic readings will be fused in `decide_level()`.
 """
 
 import base64
@@ -19,6 +17,7 @@ import http.client
 import json
 import os
 import secrets
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -564,8 +563,6 @@ class DrowsinessDetector:
                 lvl = max(lvl, 1); r.append(f"{what} {dur:.0f}s")
         if self.away_since is not None and s["t"] - self.away_since >= LOOK_AWAY_WARN_S:
             lvl = max(lvl, 1); r.append(f"looking away {s['t'] - self.away_since:.0f}s")
-        # TODO (next step): fuse MPU6050 head-nod + ultrasonic posture here,
-        #                   weighted by (1 - s["cam_conf"]) when the camera is blind.
 
         # hold alarms for a minimum time to avoid flicker
         t = s["t"]
@@ -1361,6 +1358,7 @@ def _nav_test_location(body: dict = Body(...)):
     except (TypeError, ValueError) as e:
         return {"ok": False, "error": str(e)}
     logger.info(f"Test location set: {body.get('lat')}, {body.get('lon')} course {body.get('course')}")
+    company_sync.wake()
     return {"ok": True}
 
 
@@ -1374,6 +1372,139 @@ ui.expose_api("GET", "/api/nav", _nav_state)
 ui.expose_api("GET", "/api/pois", _nav_pois)
 ui.expose_api("POST", "/api/test_location", _nav_test_location)
 ui.expose_api("GET", "/maps/thailand.pmtiles", _map_file)
+
+
+# --------------------------------------------------------------------------
+# Company server sync (S1 events, S2 offline SQLite queue, S3 ~1 min heartbeat)
+# --------------------------------------------------------------------------
+COMPANY_URL_DEFAULT = "https://antimicrosleep-head.vercel.app"
+COMPANY_URL_FILE = os.path.join(APP_DIR, "company_url.txt")
+COMPANY_KEY_FILE = os.path.join(APP_DIR, "company_api_key.txt")
+COMPANY_QUEUE_DB = os.path.join(DATA_DIR, "company_queue.sqlite")
+COMPANY_HEARTBEAT_S = 30.0
+APP_VERSION = "2026-11-20"
+
+
+class CompanySync:
+    """Background sender: heartbeats + SQLite-queued alert events to company-web."""
+
+    def __init__(self):
+        self.wake_ev = threading.Event()
+        self.db_lock = threading.Lock()
+        self.last_ok = None
+        self.last_err = None
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with self._db() as con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS queue ("
+                "id TEXT PRIMARY KEY, t REAL, level INTEGER, reasons TEXT, "
+                "lat REAL, lon REAL, speed REAL)"
+            )
+
+    def _db(self):
+        return sqlite3.connect(COMPANY_QUEUE_DB, timeout=10.0)
+
+    def _read_key(self):
+        try:
+            with open(COMPANY_KEY_FILE) as f:
+                k = f.read().strip()
+            return k if k.startswith("ams_") else ""
+        except Exception:
+            return ""
+
+    def _read_url(self):
+        try:
+            with open(COMPANY_URL_FILE) as f:
+                u = f.read().strip().rstrip("/")
+            if u.startswith("http"):
+                return u
+        except Exception:
+            pass
+        return COMPANY_URL_DEFAULT
+
+    def enqueue(self, level, reasons):
+        loc = navigator.location()
+        uid = f"{int(time.time()*1000)}-{secrets.token_hex(4)}"
+        with self.db_lock, self._db() as con:
+            con.execute(
+                "INSERT OR IGNORE INTO queue (id, t, level, reasons, lat, lon, speed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (uid, time.time(), int(level), json.dumps(list(reasons)),
+                 loc.get("lat"), loc.get("lon"), loc.get("speed")),
+            )
+        self.wake()
+
+    def wake(self):
+        self.wake_ev.set()
+
+    def _post(self, url, key, payload):
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+                "User-Agent": f"anti-microsleep/{APP_VERSION}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _step(self):
+        key = self._read_key()
+        if not key:
+            return
+        base = self._read_url()
+        loc = navigator.location()
+        st = live.stats
+        hb = {
+            "lat": loc.get("lat"),
+            "lon": loc.get("lon"),
+            "speed": loc.get("speed"),
+            "level": st.get("level_num", 0),
+            "camera_ok": st.get("status") != "NO_CAMERA",
+            "version": APP_VERSION,
+        }
+        try:
+            self._post(f"{base}/api/ingest/heartbeat", key, hb)
+            self.last_ok, self.last_err = time.time(), None
+        except Exception as e:
+            self.last_err = str(e)
+            return
+
+        with self.db_lock, self._db() as con:
+            rows = con.execute(
+                "SELECT id, t, level, reasons, lat, lon, speed FROM queue ORDER BY t ASC LIMIT 50"
+            ).fetchall()
+        if not rows:
+            return
+        events = [
+            {
+                "id": r[0], "t": round(r[1]), "level": r[2],
+                "reasons": json.loads(r[3] or "[]"),
+                "lat": r[4], "lon": r[5], "speed": r[6],
+            }
+            for r in rows
+        ]
+        try:
+            self._post(f"{base}/api/ingest/event", key, {"events": events})
+            with self.db_lock, self._db() as con:
+                con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
+            logger.info(f"Synced {len(rows)} alert event(s) to company server")
+        except Exception as e:
+            self.last_err = str(e)
+
+    def start(self):
+        def _run():
+            while True:
+                self._step()
+                self.wake_ev.wait(timeout=COMPANY_HEARTBEAT_S)
+                self.wake_ev.clear()
+        threading.Thread(target=_run, daemon=True).start()
+
+
+company_sync = CompanySync()
+company_sync.start()
 
 
 def open_camera():
@@ -1453,6 +1584,9 @@ def loop():
         logger.info(f"LEVEL {LEVEL_NAMES[last_level]} -> {LEVEL_NAMES[s['level']]}  {', '.join(s['reasons'])}")
         if s["level"] > last_level:               # record only rises (OK->WARN, ->ALARM)
             driver_log.add(s["level"], s["reasons"])
+            company_sync.enqueue(s["level"], s["reasons"])
+        else:
+            company_sync.wake()
         last_level = s["level"]
 
     if DEBUG_SNAPSHOT and t - last_log >= 2.0:

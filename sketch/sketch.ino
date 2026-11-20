@@ -18,8 +18,6 @@
 // GPS (NEO-6M / NEO-M8N, NMEA at 9600 baud) on Serial1:
 //   GPS TX -> D0 (RX), GPS RX -> D1 (TX, optional), VCC -> 3.3V, GND -> GND
 //   Once per second the position is pushed to Python: Bridge.notify("gps", ...)
-//
-// Later: MPU6050 (I2C) + ultrasonic readings will be added here and sent to Python.
 
 #include <Arduino_RouterBridge.h>
 #include <Arduino_LED_Matrix.h>
