@@ -70,16 +70,29 @@ void parseNmea(char *s) {
   }
   const char *type = f[0] + 3;            // skip "$GP" / "$GN" / "$GL" / "$BD"
   if (strcmp(type, "RMC") == 0 && n >= 9) {
-    gps.valid = f[2][0] == 'A';
-    if (gps.valid) {
+    if (f[2][0] == 'A' && f[3][0] && f[5][0]) {
+      gps.valid = true;
       gps.latE6 = nmeaToE6(f[3], f[4][0], 2);
       gps.lonE6 = nmeaToE6(f[5], f[6][0], 3);
       gps.speedX10 = (long)(atof(f[7]) * 1.852 * 10.0 + 0.5);   // knots -> km/h
       gps.courseX10 = f[8][0] ? (long)(atof(f[8]) * 10.0 + 0.5) : -1;
+    } else if (f[2][0] == 'V' && gps.sats < 3) {
+      gps.valid = false;
     }
   } else if (strcmp(type, "GGA") == 0 && n >= 9) {
     gps.sats = atoi(f[7]);
     gps.hdopX10 = (long)(atof(f[8]) * 10.0 + 0.5);
+    if (f[6][0] >= '1' && f[2][0] && f[4][0]) {
+      gps.valid = true;
+      gps.latE6 = nmeaToE6(f[2], f[3][0], 2);
+      gps.lonE6 = nmeaToE6(f[4], f[5][0], 3);
+    }
+  } else if (strcmp(type, "GLL") == 0 && n >= 7) {
+    if (f[6][0] == 'A' && f[1][0] && f[3][0]) {
+      gps.valid = true;
+      gps.latE6 = nmeaToE6(f[1], f[2][0], 2);
+      gps.lonE6 = nmeaToE6(f[3], f[4][0], 3);
+    }
   }
 }
 
@@ -194,5 +207,5 @@ void loop() {
       default:             led4(false, false, false); break;
     }
   }
-  delay(10);
+  delay(2);
 }
