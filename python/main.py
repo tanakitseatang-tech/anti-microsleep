@@ -1439,21 +1439,19 @@ class CompanySync:
 
     def _post(self, url, key, payload):
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}",
-                "User-Agent": f"anti-microsleep/{APP_VERSION}",
-            },
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "X-Truck-Code": _read_truck_id(),
+            "User-Agent": f"anti-microsleep/{APP_VERSION}",
+        }
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        req = urllib.request.Request(url, data=data, method="POST", headers=headers)
         with urllib.request.urlopen(req, timeout=8.0) as r:
             return json.loads(r.read().decode("utf-8"))
 
     def _step(self):
         key = self._read_key()
-        if not key:
-            return
         base = self._read_url()
         loc = navigator.location()
         st = live.stats
