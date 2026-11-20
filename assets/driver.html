@@ -133,6 +133,7 @@
 <div class="top">
   <div class="pill"><span class="dot" id="dot"></span><span id="title">ANTI MICROSLEEP</span></div>
   <div class="spacer"></div>
+  <button class="pill small" id="mapModeBtn" style="cursor:pointer">🗺️ แผนที่ละเอียด</button>
   <div class="pill small" id="gpsPill">GPS…</div>
 </div>
 <button class="recenter" id="recenter" title="กลับไปที่รถ" aria-label="กลับไปที่รถ">◎</button>
@@ -209,25 +210,40 @@ const TYPE_COLOR = { fuel: "#f97316", rest_area: "#22c55e", cafe: "#a78bfa" };
 const TYPES = ["fuel", "rest_area", "cafe"];
 
 // ------------------------------------------------------------------ map
-// offline map data stops at zoom 14 (thailand.pmtiles); deeper zooms stretch zoom-14 data
+// offline map data stops at zoom 14 (thailand.pmtiles); when online we overlay OpenStreetMap tiles
+// so zooming in up to level 19 shows every small soi, street, and building clearly.
 const MAP_DATA_MAX_ZOOM = 14;
-const map = L.map("map", { zoomControl: false, attributionControl: true, maxZoom: 18 }).setView([13.7563, 100.5018], 13);
-let baseLayer = null;
-function setBase(offline) {
-  if (baseLayer && baseLayer._offline === offline) return;
-  if (baseLayer) map.removeLayer(baseLayer);
-  if (offline) {
+const map = L.map("map", { zoomControl: false, attributionControl: true, maxZoom: 19 }).setView([13.6572, 100.6314], 15);
+let baseLayer = null, detailLayer = null, preferDetail = true;
+
+function setBase(offlineAvailable) {
+  const useOffline = offlineAvailable && !preferDetail;
+  const modeKey = useOffline ? "offline" : "detail";
+  if (baseLayer && baseLayer._modeKey === modeKey) return;
+  if (baseLayer) { map.removeLayer(baseLayer); baseLayer = null; }
+  if (detailLayer) { map.removeLayer(detailLayer); detailLayer = null; }
+
+  if (offlineAvailable) {
     baseLayer = protomapsL.leafletLayer({ url: "/maps/thailand.pmtiles", flavor: "dark", lang: "th",
-      maxDataZoom: MAP_DATA_MAX_ZOOM, maxZoom: 18,
+      maxDataZoom: MAP_DATA_MAX_ZOOM, maxZoom: 19,
       attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> · Protomaps' });
-  } else {
-    // no offline map installed yet: online map tiles (needs signal)
-    baseLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      { maxZoom: 19, attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>' });
+    baseLayer.addTo(map);
   }
-  baseLayer._offline = offline;
-  baseLayer.addTo(map);
+  if (!useOffline) {
+    detailLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>' });
+    detailLayer.addTo(map);
+  }
+  if (baseLayer) baseLayer._modeKey = modeKey;
+  else if (detailLayer) { baseLayer = detailLayer; baseLayer._modeKey = modeKey; }
+  $("mapModeBtn").textContent = useOffline ? "🗺️ แผนที่ออฟไลน์" : "🗺️ แผนที่ละเอียด";
 }
+
+$("mapModeBtn").onclick = () => {
+  preferDetail = !preferDetail;
+  if (baseLayer) baseLayer._modeKey = null;
+  setBase(!!(nav && nav.offline_map));
+};
 
 const truckIcon = (course) => L.divIcon({ className: "truck", iconSize: [34, 34], iconAnchor: [17, 17], html:
   `<svg viewBox="0 0 34 34"><circle cx="17" cy="17" r="15" fill="#4ea1ff" stroke="#fff" stroke-width="3"/>` +
@@ -329,10 +345,33 @@ function renderStop() {
     ]).addTo(map);
     nearestMarker.bringToFront();
   } else {
-    // no road router: straight dashed line
+    // no local road route (e.g. inside a small soi): draw dashed line immediately and try online OSRM full-street route
     nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[selType], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
+    const key = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
+    if (window._onlineRouteKey !== key) {
+      window._onlineRouteKey = key;
+      fetch(`https://router.project-osrm.org/route/v1/driving/${here[1]},${here[0]};${n.lon},${n.lat}?overview=full&geometries=geojson`)
+        .then(r => r.json())
+        .then(d => {
+          if (d.routes && d.routes[0]) {
+            n.route = d.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+            n.road_m = Math.round(d.routes[0].distance);
+            n.road_s = Math.round(d.routes[0].duration);
+            renderStop();
+          }
+        }).catch(() => {});
+    }
   }
 }
+
+document.querySelector(".stop").style.cursor = "pointer";
+document.querySelector(".stop").onclick = () => {
+  const n = nav && nav.nearest ? nav.nearest[selType] : null;
+  if (n && nav && nav.loc && nav.loc.lat != null) {
+    follow = false;
+    map.fitBounds([[nav.loc.lat, nav.loc.lon], [n.lat, n.lon]], { paddingTopLeft: [30, 70], paddingBottomRight: [30, 260], maxZoom: 16 });
+  }
+};
 
 async function pollNav(once) {
   try {
