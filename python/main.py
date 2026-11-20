@@ -1610,6 +1610,21 @@ COMPANY_HEARTBEAT_S = 5.0
 APP_VERSION = "2026-11-20"
 
 
+HOST_IP_FILE = os.path.join(DATA_DIR, "host_ip.json")   # written by tools/host_ip.sh on the board
+
+
+def _host_network():
+    """Board's Wi-Fi IP / network name as seen by the board itself (Docker hides it from us)."""
+    try:
+        with open(HOST_IP_FILE) as f:
+            d = json.load(f)
+        if time.time() - float(d.get("t", 0)) < 60 and d.get("ip"):
+            return {"local_ip": str(d["ip"])[:40], "wifi": str(d.get("wifi") or "")[:64]}
+    except Exception:
+        pass
+    return {}
+
+
 class CompanySync:
     """Background sender: heartbeats + SQLite-queued alert events to company-web."""
 
@@ -1694,6 +1709,7 @@ class CompanySync:
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
         }
+        hb.update(_host_network())                  # board Wi-Fi IP + network name (for /go QR)
         try:
             self._post(f"{base}/api/ingest/heartbeat", key, hb)
             self.last_ok, self.last_err = time.time(), None
