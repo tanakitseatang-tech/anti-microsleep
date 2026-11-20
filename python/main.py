@@ -64,6 +64,11 @@ BASELINE_DROP_PER_MIN = 0.03  # baseline may fall only slowly (drowsy eyes must 
 NEW_DRIVER_NO_FACE_S = 30.0   # no face this long -> forget baseline (driver may change)
 EYES_CLOSED_WARN_S = 1.0      # eyes closed this long -> WARNING
 EYES_CLOSED_ALARM_S = 2.0     # eyes closed this long -> ALARM (microsleep)
+SQUINT_CLOSED_WARN_S = 1.5    # closure seen only as "narrow + no iris" (glasses / squint):
+SQUINT_CLOSED_ALARM_S = 3.0   # ...warn / alarm a bit later, so a squint is not a microsleep
+REOPEN_MARGIN = 1.00          # a closure ends only when EAR rises above the squint threshold
+HOLD_AFTER_S = 0.5            # closures longer than this also ride over short "open" flickers
+REOPEN_GRACE_S = 0.3          # ...eyes must look open this long to end the closure
 
 PERCLOS_WINDOW_S = 60.0
 PERCLOS_MIN_DATA_S = 20.0
@@ -269,6 +274,8 @@ class DrowsinessDetector:
         self.ear_buf = deque(maxlen=3)
         self.closed_since = None            # effective closure (after AI veto/confirm)
         self.ear_closed_since = None        # closure according to EAR only
+        self.reopen_since = None            # eyes look open again since (hysteresis)
+        self.ep_min_ear = None              # lowest EAR in the current closure
         self.closed_hist = deque()          # (t, closed: bool)
         self.yawn_since = None
         self.yawn_counted = False
@@ -445,11 +452,27 @@ class DrowsinessDetector:
                         s["squint"] = not ear_closed  # narrow but iris visible = squint
                 else:
                     ear_closed = False
+                # Hysteresis: once the eyes are closed they count as closed until they clearly
+                # reopen. Glasses make EAR / iris flicker around the squint edge, which used to
+                # reset the timer every few frames so the alarm never came.
+                if ear_closed:
+                    self.reopen_since = None
+                elif self.ear_closed_since is not None:
+                    if ear < self.squint_threshold * REOPEN_MARGIN:
+                        ear_closed, self.reopen_since = True, None
+                        s["squint"] = False
+                    elif t - self.ear_closed_since >= HOLD_AFTER_S:
+                        if self.reopen_since is None:
+                            self.reopen_since = t
+                        ear_closed = t - self.reopen_since < REOPEN_GRACE_S
                 if ear_closed:
                     if self.ear_closed_since is None:
-                        self.ear_closed_since = t
+                        self.ear_closed_since, self.ep_min_ear = t, ear
+                    self.ep_min_ear = min(self.ep_min_ear, ear)
                 else:
-                    self.ear_closed_since = None
+                    self.ear_closed_since, self.reopen_since, self.ep_min_ear = None, None, None
+                # clearly shut at some point in this closure? (else: only narrow = maybe a squint)
+                s["closed_clear"] = self.ep_min_ear is not None and self.ep_min_ear < self.ear_threshold
                 closed = ear_closed
 
                 # --- AI second opinion (Roboflow), only if a fresh verdict exists ---
@@ -564,9 +587,13 @@ class DrowsinessDetector:
 
     def _decide_level(self, s, light_ok):
         lvl, r = 0, s["reasons"]
-        if s["closed_for"] >= EYES_CLOSED_ALARM_S:
+        # clearly shut eyes: alarm at 2 s. Only narrow (glasses / maybe squinting): 3 s.
+        clear = s.get("closed_clear", True)
+        alarm_s = EYES_CLOSED_ALARM_S if clear else SQUINT_CLOSED_ALARM_S
+        warn_s = EYES_CLOSED_WARN_S if clear else SQUINT_CLOSED_WARN_S
+        if s["closed_for"] >= alarm_s:
             lvl = 2; r.append(f"microsleep {s['closed_for']:.1f}s")
-        elif s["closed_for"] >= EYES_CLOSED_WARN_S:
+        elif s["closed_for"] >= warn_s:
             lvl = max(lvl, 1); r.append(f"eyes closed {s['closed_for']:.1f}s")
         p = s["perclos"]
         # PERCLOS looks back 60 s, so it only WARNS ("you've been drowsy lately").
@@ -593,7 +620,7 @@ class DrowsinessDetector:
         if self.narrow_since is not None and s["t"] - self.narrow_since >= NARROW_WARN_S:
             lvl = max(lvl, 1); r.append(f"heavy eyelids {s['t'] - self.narrow_since:.0f}s")
         cf = s.get("closed_frac")
-        if cf is not None and cf >= CLOSED_FRAC_ALARM and lvl < 2:
+        if cf is not None and cf >= CLOSED_FRAC_ALARM and lvl < 2 and clear:
             lvl = 2; r.append(f"eyes closed {cf:.0%} of last 2s")
         if self.head_since is not None:
             dur = s["t"] - self.head_since
