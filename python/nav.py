@@ -9,6 +9,7 @@ Navigation helpers for the driver page (all offline, on the board):
     (falls back to straight line otherwise).
 """
 
+from collections import deque
 import json
 import math
 import os
@@ -26,7 +27,8 @@ AHEAD_MIN_KMH = 15             # heading only trusted above this speed
 BEHIND_PENALTY = 2.5           # behind-the-truck stops count as this much farther
 RECOMPUTE_S = 10.0
 RECOMPUTE_M = 250.0
-GPS_STALE_S = 5.0
+GPS_STALE_S = 6.0
+GPS_FIX_HOLD_S = 20.0          # keep last valid fix through brief roof/building signal dips
 OSRM_PORT = 5000
 OSRM_TIMEOUT_S = 2.0
 HEADING_TOL_DEG = 45           # route must leave the truck within +-45 deg of its heading
@@ -132,6 +134,12 @@ class Navigator:
         self.lock = threading.Lock()
         self.calc_lock = threading.Lock()
         self.gps = {"state": -1, "t": 0.0}
+        self._sats_hist = deque(maxlen=10)      # (t, sats) for stable satellite count
+        self._pos_hist = deque(maxlen=6)        # (t, lat, lon, raw_speed) for speed & coord smoothing
+        self._smooth_lat = None
+        self._smooth_lon = None
+        self._smooth_speed = 0.0
+        self._last_fix = None                   # last valid GPS fix dictionary
         self.osrm = f"http://{_docker_host_ip()}:{OSRM_PORT}"
         self.osrm_ok = None
         self.result, self._last_at, self._last_t = {}, None, 0.0
@@ -159,12 +167,79 @@ class Navigator:
             self.test_loc, self._last_at = (lat, lon, course), None
 
     def on_gps(self, state, lat_e6, lon_e6, speed_x10, course_x10, sats, hdop_x10):
-        """Bridge handler: called by the MCU once per second."""
-        g = {"state": int(state), "t": time.time(), "sats": int(sats), "hdop": hdop_x10 / 10.0}
-        if int(state) == 1:
-            g.update(lat=lat_e6 / 1e6, lon=lon_e6 / 1e6, speed=speed_x10 / 10.0,
-                     course=course_x10 / 10.0 if course_x10 >= 0 else None)
+        """Bridge handler: called by the MCU once per second. Stabilizes sats, coords, and walking speed."""
+        now = time.time()
+        raw_state = int(state)
+        raw_sats = max(0, int(sats))
+
         with self.lock:
+            # 1. Stabilize satellite count over a 10-second rolling window
+            if raw_sats > 0:
+                self._sats_hist.append((now, raw_sats))
+            while self._sats_hist and now - self._sats_hist[0][0] > 10.0:
+                self._sats_hist.popleft()
+            if self._sats_hist:
+                vals = sorted(v for _, v in self._sats_hist)
+                stable_sats = vals[len(vals) // 2]   # median prevents 1-second spikes/drops
+            else:
+                stable_sats = raw_sats
+
+            g = {"state": raw_state, "t": now, "sats": stable_sats, "hdop": hdop_x10 / 10.0}
+
+            if raw_state == 1 and (lat_e6 != 0 or lon_e6 != 0):
+                raw_lat, raw_lon = lat_e6 / 1e6, lon_e6 / 1e6
+                raw_spd = max(0.0, speed_x10 / 10.0)
+
+                # Smooth coordinates (EMA) to suppress multipath wander when walking/stationary
+                if self._smooth_lat is None or haversine_m(self._smooth_lat, self._smooth_lon, raw_lat, raw_lon) > 80.0:
+                    self._smooth_lat, self._smooth_lon = raw_lat, raw_lon
+                else:
+                    alpha = 0.35 if raw_spd < 12.0 else 0.65
+                    self._smooth_lat += alpha * (raw_lat - self._smooth_lat)
+                    self._smooth_lon += alpha * (raw_lon - self._smooth_lon)
+
+                self._pos_hist.append((now, self._smooth_lat, self._smooth_lon, raw_spd))
+                while len(self._pos_hist) > 1 and now - self._pos_hist[0][0] > 5.0:
+                    self._pos_hist.popleft()
+
+                # Calculate stabilized speed: check real net displacement over window to kill stationary GPS drift
+                if len(self._pos_hist) >= 2:
+                    t0, lat0, lon0, _ = self._pos_hist[0]
+                    dt = max(1.0, now - t0)
+                    net_dist_m = haversine_m(lat0, lon0, self._smooth_lat, self._smooth_lon)
+                    net_kmh = (net_dist_m / dt) * 3.6
+                    med_raw = sorted(p[3] for p in self._pos_hist)[len(self._pos_hist) // 2]
+                    # If moved < 2.2 m over the window or both speeds < 1.3 km/h -> standing still (0 km/h)
+                    if (dt >= 2.5 and net_dist_m < 2.2) or (med_raw < 1.3 and net_kmh < 1.3):
+                        target_spd = 0.0
+                    else:
+                        target_spd = 0.6 * med_raw + 0.4 * net_kmh
+                else:
+                    target_spd = 0.0 if raw_spd < 1.5 else raw_spd
+
+                if target_spd == 0.0 and self._smooth_speed < 1.8:
+                    self._smooth_speed = 0.0
+                else:
+                    self._smooth_speed = 0.4 * target_spd + 0.6 * self._smooth_speed
+                    if self._smooth_speed < 0.8:
+                        self._smooth_speed = 0.0
+
+                g.update(
+                    lat=round(self._smooth_lat, 6),
+                    lon=round(self._smooth_lon, 6),
+                    speed=round(self._smooth_speed, 1),
+                    course=course_x10 / 10.0 if course_x10 >= 0 else None,
+                )
+                self._last_fix = dict(g)
+            elif raw_state >= 0 and self._last_fix and (now - self._last_fix["t"] < GPS_FIX_HOLD_S):
+                # Hold the last good GPS fix during brief indoor/roof dips so the map & sats don't flicker
+                g = {
+                    **self._last_fix,
+                    "t": now,
+                    "sats": max(stable_sats, self._last_fix.get("sats", 4)),
+                    "speed": round(self._smooth_speed * 0.8, 1) if self._smooth_speed >= 1.0 else 0.0,
+                }
+
             if self.gps.get("state") != g["state"]:
                 self.log.info(f"GPS state {self.gps.get('state')} -> {g['state']} (sats {g['sats']})")
             self.gps = g

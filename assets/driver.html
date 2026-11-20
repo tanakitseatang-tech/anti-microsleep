@@ -379,7 +379,8 @@ async function pollNav(once) {
     nav = await r.json();
     setBase(!!nav.offline_map);
     const loc = nav.loc;
-    const gpsTxt = loc.source === "gps" ? `GPS ✓ ${loc.sats || 0} ดวง${loc.speed != null ? " · " + Math.round(loc.speed) + " กม./ชม." : ""}`
+    const spdStr = loc.speed == null ? "" : ` · ${loc.speed > 0 && loc.speed < 10 ? loc.speed.toFixed(1) : Math.round(loc.speed)} กม./ชม.`;
+    const gpsTxt = loc.source === "gps" ? `GPS ✓ ${loc.sats || 0} ดวง${spdStr}`
       : loc.gps === 0 ? `GPS กำลังหาดาวเทียม (${loc.sats || 0})` : "ไม่มี GPS";
     $("gpsPill").textContent = gpsTxt;
     $("testnote").hidden = loc.source !== "test";
