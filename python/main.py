@@ -107,7 +107,12 @@ YAW_MAX = 0.35                # |yaw| above this = head turned, eyes not judged
 YAW_LEARN_MAX = 0.15          # learning only uses frames facing the driver's normal direction
 YAW_BASE_MAX = 0.55           # camera may sit off to the side: the driver's normal yaw is learned
                               # (median of the last 2 min) and yaw is judged relative to it, up to this
-YAW_BASE_MIN_FRAMES = 100     # face frames needed before the learned normal yaw is used
+YAW_BASE_MIN_FRAMES = 20      # face frames needed before the learned normal yaw is used (~1.5 s)
+HAAR_CROP_W = 96              # eye crop width for the open-eye image detector
+HAAR_MIN_SAMPLES = 20         # open-eye checks needed before trusting the detector for a driver
+HAAR_RELIABLE = 0.75          # detector must find this driver's open eyes >= 75 % of the time
+HAAR_LEARN_EVERY_S = 0.3
+HAAR_DOUBT_RATIO = 0.88       # EAR below baseline*0.88 (and not clearly shut) -> ask the detector
 LOOK_AWAY_WARN_S = 4.0        # head turned away this long -> WARNING (distraction)
 LOOK_AWAY_ALARM_S = 10.0      # ... this long -> ALARM (eyes off the road far too long, or asleep turned)
 NO_FACE_WARN_S = 4.0         # good light but no face this long -> WARNING
@@ -238,6 +243,48 @@ def iris_visible_fraction(gray, pts):
     return max(scores) if scores else None
 
 
+_EYE_CASCADE = None
+
+
+def open_eyes_seen(gray, pts):
+    """Image check that does not trust the eyelid landmarks (they stay "open" behind glasses):
+    OpenCV's open-eye detector for glasses runs on a crop around each eye's corners. An open
+    eye is usually found, a closed eye usually not. Returns the fraction of eyes found (0..1),
+    or None if the face is too small to check."""
+    global _EYE_CASCADE
+    if _EYE_CASCADE is None:
+        _EYE_CASCADE = cv2.CascadeClassifier(
+            os.path.join(cv2.data.haarcascades, "haarcascade_eye_tree_eyeglasses.xml"))
+    if _EYE_CASCADE.empty():
+        return None
+    H, W = gray.shape[:2]
+    tried = found = 0
+    for c0, c1 in ((33, 133), (362, 263)):
+        p0, p1 = pts[c0], pts[c1]
+        w = float(np.linalg.norm(p1 - p0))
+        if w < 10:
+            continue
+        cx, cy = (p0 + p1) / 2
+        x0, x1 = max(0, int(cx - w)), min(W, int(cx + w))
+        y0, y1 = max(0, int(cy - w * 0.8)), min(H, int(cy + w * 0.8))
+        if x1 - x0 < 10 or y1 - y0 < 10:
+            continue
+        crop = gray[y0:y1, x0:x1]
+        scale = HAAR_CROP_W / crop.shape[1]
+        crop = cv2.equalizeHist(cv2.resize(crop, None, fx=scale, fy=scale,
+                                           interpolation=cv2.INTER_LINEAR))
+        ch, cw = crop.shape[:2]
+        eyes = _EYE_CASCADE.detectMultiScale(crop, 1.1, 3,
+                                             minSize=(int(cw * 0.3), int(cw * 0.3)))
+        tried += 1
+        ex, ey = (cx - x0) * scale, (cy - y0) * scale          # where the eye should be
+        for (x, y, ew, eh) in eyes:
+            if abs(x + ew / 2 - ex) < cw * 0.25 and abs(y + eh / 2 - ey) < ch * 0.3:
+                found += 1
+                break
+    return found / tried if tried else None
+
+
 def mouth_aspect_ratio(pts):
     p = pts[MOUTH]
     horiz = _d(p[0], p[1])
@@ -276,6 +323,8 @@ class DrowsinessDetector:
         self.ear_closed_since = None        # closure according to EAR only
         self.reopen_since = None            # eyes look open again since (hysteresis)
         self.ep_min_ear = None              # lowest EAR in the current closure
+        self.haar_open = deque(maxlen=60)   # open-eye detector results on clearly open eyes
+        self.haar_learn_t = 0.0
         self.closed_hist = deque()          # (t, closed: bool)
         self.yawn_since = None
         self.yawn_counted = False
@@ -298,6 +347,13 @@ class DrowsinessDetector:
         self.squint_threshold = EAR_DEFAULT_SQUINT
         self.narrow_threshold = EAR_DEFAULT_NARROW
         self.calibrated = False
+        self.haar_open.clear()
+
+    def haar_rate(self):
+        """How often the open-eye detector finds this driver's open eyes (None = not known yet)."""
+        if len(self.haar_open) < HAAR_MIN_SAMPLES:
+            return None
+        return float(np.mean(self.haar_open))
 
     def _relative_yaw(self, t, yaw):
         """Yaw relative to the driver's learned normal direction (camera may be off to the side)."""
@@ -437,9 +493,30 @@ class DrowsinessDetector:
             # is exactly when a microsleep happens: keep judging the eyes then.
             judge_eyes = frontal or (head_off and abs(yaw) < YAW_POSE_MAX)
             if judge_eyes:
+                # --- image check (works through glasses): learn how well it sees this
+                #     driver's open eyes, then ask it whenever EAR is in doubt ---
+                haar = None
+                doubt_thr = max(self.squint_threshold,
+                                (self.baseline or 0.0) * HAAR_DOUBT_RATIO)
+                if (frontal and ear > doubt_thr and not head_off
+                        and t - self.haar_learn_t >= HAAR_LEARN_EVERY_S):
+                    self.haar_learn_t = t
+                    h = open_eyes_seen(gray, pts)
+                    if h is not None:
+                        self.haar_open.append(1.0 if h > 0 else 0.0)   # >= 1 open eye seen
+                rate = self.haar_rate()
+                s["haar_rate"] = rate
+                use_haar = rate is not None and rate >= HAAR_RELIABLE
+                if use_haar and not head_off and self.ear_threshold <= ear < doubt_thr:
+                    haar = open_eyes_seen(gray, pts)
+                s["haar"] = haar
                 # 3 zones: clearly closed / squint zone (check iris) / open
                 if ear < self.ear_threshold:
                     ear_closed = True
+                elif haar is not None:
+                    # detector is reliable for this driver: no open eye found = closed
+                    ear_closed = haar == 0
+                    s["squint"] = not ear_closed and ear < self.squint_threshold
                 elif ear < self.squint_threshold:
                     if head_off:
                         # head dropped + narrow eyes = nodding off; no squint excuse
@@ -458,7 +535,9 @@ class DrowsinessDetector:
                 if ear_closed:
                     self.reopen_since = None
                 elif self.ear_closed_since is not None:
-                    if ear < self.squint_threshold * REOPEN_MARGIN:
+                    if haar is not None and haar > 0 and t - self.ear_closed_since < HOLD_AFTER_S:
+                        pass                                  # detector sees an open eye: blink over
+                    elif ear < self.squint_threshold * REOPEN_MARGIN and not (haar is not None and haar > 0):
                         ear_closed, self.reopen_since = True, None
                         s["squint"] = False
                     elif t - self.ear_closed_since >= HOLD_AFTER_S:
@@ -1729,6 +1808,8 @@ def loop():
                     f" down={s['head_down']} tilt={s['head_tilt']}"
                     f" yaw={s['yaw'] if s['yaw'] is None else round(s['yaw'], 2)}"
                     f" ai={s.get('ai')}/{s.get('ai_note')}"
+                    f" haar={s.get('haar')} rate={s.get('haar_rate') if s.get('haar_rate') is None else round(s['haar_rate'], 2)}"
+                    f" cf={s['closed_for']:.1f}"
                     f" | mouth={s['mouth'] if s['mouth'] is None else round(s['mouth'], 2)}"
                     f" base={detector.base_mouth if detector.base_mouth is None else round(detector.base_mouth, 2)}"
                     f" smile={s['smiling']}")
