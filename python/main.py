@@ -82,6 +82,9 @@ HEAD_EYES_FRAC = 0.50         # head down/tilted + eyes closed >= 50 % of last 2
 HEAD_EYES_MIN_S = 1.5         # ...once the head has been down at least this long
 HEAD_DOWN_DEG = 18.0         # head pitched down this much below the driver's normal pose
 HEAD_TILT_DEG = 25.0          # head tilted sideways (roll) this much vs normal pose
+HEAD_BACK_DEG = 12.0          # head fallen BACK (chin up, asleep against the seat) this much vs normal
+YAW_POSE_MAX = 0.75           # with the head dropped/back/tilted, eyes are still judged up to this yaw
+                              # (a fallen head distorts the yaw estimate; never stop watching the eyes then)
 HEAD_WARN_S = 2.0             # head down / tilted this long -> WARNING
 HEAD_ALARM_S = 5.0            # head down / tilted this long -> ALARM (nodding off)
 DROP_WARN_S = 1.0             # face vanished right after the head went down -> WARNING
@@ -96,6 +99,7 @@ PITCH_DOWN_SIGN = 1.0        # +1 if pitch grows when the head goes down (checke
 YAW_MAX = 0.35                # |yaw| above this = head turned, eyes not judged
 YAW_LEARN_MAX = 0.15          # learning only uses frames facing the camera
 LOOK_AWAY_WARN_S = 4.0        # head turned away this long -> WARNING (distraction)
+LOOK_AWAY_ALARM_S = 10.0      # ... this long -> ALARM (eyes off the road far too long, or asleep turned)
 NO_FACE_WARN_S = 4.0         # good light but no face this long -> WARNING
 LOW_LIGHT_BRIGHTNESS = 35     # mean gray level below this = camera "blind"
 
@@ -338,6 +342,7 @@ class DrowsinessDetector:
         s["ai"], s["ai_conf"], s["ai_note"] = None, None, None
         s["iris"], s["squint"], s["eyes_closed"] = None, False, False
         s["pitch"], s["roll"], s["head_down"], s["head_tilt"] = None, None, False, False
+        s["head_back"] = False
         s["mouth"], s["smiling"] = None, False
         if pts is not None:
             self.no_face_since = None
@@ -371,12 +376,15 @@ class DrowsinessDetector:
             self.recent_face.append((t, pitch, float(pts[:, 1].mean()) / fh))
             while self.recent_face and t - self.recent_face[0][0] > 2.0:
                 self.recent_face.popleft()
-            down = (pitch is not None and self.base_pitch is not None
-                    and (pitch - self.base_pitch) * PITCH_DOWN_SIGN > HEAD_DOWN_DEG)
+            pd = ((pitch - self.base_pitch) * PITCH_DOWN_SIGN
+                  if pitch is not None and self.base_pitch is not None else None)
+            down = pd is not None and pd > HEAD_DOWN_DEG
+            back = pd is not None and pd < -HEAD_BACK_DEG      # chin up: asleep leaning back
             tilt = abs(roll - (self.base_roll or 0.0)) > HEAD_TILT_DEG
-            s["head_down"], s["head_tilt"] = down, tilt
+            s["head_down"], s["head_tilt"], s["head_back"] = down, tilt, back
             self.last_head_down = down
-            if down or tilt:
+            head_off = down or tilt or back
+            if head_off:
                 if self.head_since is None:
                     self.head_since = t
             else:
@@ -388,15 +396,19 @@ class DrowsinessDetector:
             s["mouth"], s["smiling"] = mouth, smiling
 
             # --- learn this driver's open-eye EAR + normal head pose in the background ---
-            self._learn(t, ear, yaw, pitch if not (down or tilt) else None, roll, mouth)
+            self._learn(t, ear, yaw, pitch if not head_off else None, roll, mouth)
 
-            # --- eyes closed duration (only when facing the camera) ---
-            if frontal:
+            # --- eyes closed duration ---
+            # Normally only when facing the camera (a turned head makes eyes look narrow).
+            # But a head that dropped / fell back / tilted distorts the yaw estimate, and that
+            # is exactly when a microsleep happens: keep judging the eyes then.
+            judge_eyes = frontal or (head_off and abs(yaw) < YAW_POSE_MAX)
+            if judge_eyes:
                 # 3 zones: clearly closed / squint zone (check iris) / open
                 if ear < self.ear_threshold:
                     ear_closed = True
                 elif ear < self.squint_threshold:
-                    if down or tilt:
+                    if head_off:
                         # head dropped + narrow eyes = nodding off; no squint excuse
                         # (lash line looks dark from above and fools the iris check)
                         ear_closed = True
@@ -428,7 +440,7 @@ class DrowsinessDetector:
                         s["ai_note"] = "veto"
                     # (no "AI confirms closed" rule: tests showed the cloud model
                     #  calls squinting eyes "closed eye", so it may only veto)
-                if closed and smiling and not (down or tilt):
+                if closed and smiling and not head_off:
                     closed = False                          # laughing squeezes the eyes shut
                     s["squint"] = True
                 s["eyes_closed"] = closed
@@ -554,15 +566,20 @@ class DrowsinessDetector:
             lvl = 2; r.append(f"eyes closed {cf:.0%} of last 2s")
         if self.head_since is not None:
             dur = s["t"] - self.head_since
-            what = "head down" if s.get("head_down") else "head tilted"
+            what = ("head down" if s.get("head_down") else
+                    "head back" if s.get("head_back") else "head tilted")
             if dur >= HEAD_EYES_MIN_S and cf is not None and cf >= HEAD_EYES_FRAC:
                 lvl = 2; r.append(f"{what} + eyes closed")          # nodding off
             elif dur >= HEAD_ALARM_S:
                 lvl = 2; r.append(f"{what} {dur:.0f}s")
             elif dur >= HEAD_WARN_S:
                 lvl = max(lvl, 1); r.append(f"{what} {dur:.0f}s")
-        if self.away_since is not None and s["t"] - self.away_since >= LOOK_AWAY_WARN_S:
-            lvl = max(lvl, 1); r.append(f"looking away {s['t'] - self.away_since:.0f}s")
+        if self.away_since is not None:
+            dur = s["t"] - self.away_since
+            if dur >= LOOK_AWAY_ALARM_S:
+                lvl = 2; r.append(f"looking away {dur:.0f}s")
+            elif dur >= LOOK_AWAY_WARN_S:
+                lvl = max(lvl, 1); r.append(f"looking away {dur:.0f}s")
 
         # hold alarms for a minimum time to avoid flicker
         t = s["t"]
@@ -987,6 +1004,7 @@ class LiveView:
                            if s.get("pitch") is not None and detector.base_pitch is not None else None,
             "roll_delta": s["roll"] - (detector.base_roll or 0.0) if s.get("roll") is not None else None,
             "head_down": s.get("head_down", False), "head_tilt": s.get("head_tilt", False),
+            "head_back": s.get("head_back", False),
             "iris": s.get("iris"), "squint_threshold": detector.squint_threshold,
             "ai": s.get("ai"), "ai_conf": s.get("ai_conf"), "ai_note": s.get("ai_note"),
             "ai_status": eye_model.status if eye_model else "off (no API key)",

@@ -237,9 +237,9 @@ function render(s) {
   $("cal").textContent = s.calibrated ? "เรียนรู้แล้ว" : "กำลังเรียนรู้…";
   const pd = s.pitch_delta, rd = s.roll_delta;
   $("head").textContent = rd == null ? "—"
-    : (s.head_down ? "ก้ม! " : s.head_tilt ? "เอียง! " : "ปกติ ")
+    : (s.head_down ? "ก้ม! " : s.head_back ? "เอนหลัง! " : s.head_tilt ? "เอียง! " : "ปกติ ")
       + `(${pd == null ? "?" : (pd > 0 ? "+" : "") + Math.round(pd)}° / ${Math.round(rd)}°)`;
-  $("head").style.color = s.head_down || s.head_tilt ? "var(--warn)" : "";
+  $("head").style.color = s.head_down || s.head_back || s.head_tilt ? "var(--warn)" : "";
   const aiTh = { open: "ลืมตา", closed: "หลับตา" };
   const note = s.ai_note === "veto" ? " · ยกเลิกตาปิดผิด" : "";
   $("ai").textContent = s.ai ? `${aiTh[s.ai]} ${Math.round((s.ai_conf || 0) * 100)}%${note}` : "—";
