@@ -103,7 +103,8 @@ PERSON_FRESH_S = 1.5          # a person result is trusted this long
 DROP_PITCH_RISE = 8.0        # head pitched down by this much in the last 2 s before losing the face
 DROP_FACE_SLIDE = 0.06        # or the face slid down by 6 % of the frame height
 PITCH_DOWN_SIGN = 1.0        # +1 if pitch grows when the head goes down (checked on device)
-YAW_MAX = 0.35                # |yaw| above this = head turned, eyes not judged
+YAW_MAX = 0.35                # |yaw| above this = head turned (looking-away timer)
+YAW_EYES_MAX = 0.50           # eyes are still judged up to this |yaw| (yaw estimate is jumpy)
 YAW_LEARN_MAX = 0.15          # learning only uses frames facing the driver's normal direction
 YAW_BASE_MAX = 0.55           # camera may sit off to the side: the driver's normal yaw is learned
                               # (median of the last 2 min) and yaw is judged relative to it, up to this
@@ -305,6 +306,7 @@ class DrowsinessDetector:
         self.mouth_samples = deque()        # (t, mouth width / eye distance)
         self.base_mouth = None
         self.pitch_buf = deque(maxlen=5)
+        self.yaw_buf = deque(maxlen=5)
         self.recent_face = deque()          # (t, pitch, face centre y / frame h), last 2 s
         self.last_head_down = False
         self.dropped = False                # face vanished downward = head dropped
@@ -444,9 +446,12 @@ class DrowsinessDetector:
             # A turned head makes the eyes look narrow (low EAR) -> ignore eyes then.
             dl, dr = _d(pts[NOSE_TIP], pts[FACE_LEFT]), _d(pts[NOSE_TIP], pts[FACE_RIGHT])
             raw_yaw = (dl - dr) / max(dl + dr, 1e-6)
+            self.yaw_buf.append(raw_yaw)
+            raw_yaw = float(np.median(self.yaw_buf))   # landmark jitter: median of 5 frames
             yaw = self._relative_yaw(t, raw_yaw)     # 0 = the driver's normal direction
             s["yaw"], s["raw_yaw"] = yaw, raw_yaw
             frontal = abs(yaw) < YAW_MAX
+            eyes_ok = abs(yaw) < YAW_EYES_MAX         # eyes still readable (a bit turned is fine)
             s["looking_away"] = not frontal
             if frontal:
                 self.away_since = None
@@ -491,7 +496,7 @@ class DrowsinessDetector:
             # Normally only when facing the camera (a turned head makes eyes look narrow).
             # But a head that dropped / fell back / tilted distorts the yaw estimate, and that
             # is exactly when a microsleep happens: keep judging the eyes then.
-            judge_eyes = frontal or (head_off and abs(yaw) < YAW_POSE_MAX)
+            judge_eyes = eyes_ok or (head_off and abs(yaw) < YAW_POSE_MAX)
             if judge_eyes:
                 # --- image check (works through glasses): learn how well it sees this
                 #     driver's open eyes, then ask it whenever EAR is in doubt ---
@@ -1808,6 +1813,8 @@ def loop():
                     f" down={s['head_down']} tilt={s['head_tilt']}"
                     f" yaw={s['yaw'] if s['yaw'] is None else round(s['yaw'], 2)}"
                     f" ai={s.get('ai')}/{s.get('ai_note')}"
+                    f" raw={s.get('raw_yaw') if s.get('raw_yaw') is None else round(s['raw_yaw'], 2)}"
+                    f" byaw={round(detector.base_yaw, 2)} fx={float(pts[:, 0].mean()) / frame.shape[1]:.2f}"
                     f" haar={s.get('haar')} rate={s.get('haar_rate') if s.get('haar_rate') is None else round(s['haar_rate'], 2)}"
                     f" cf={s['closed_for']:.1f}"
                     f" | mouth={s['mouth'] if s['mouth'] is None else round(s['mouth'], 2)}"
