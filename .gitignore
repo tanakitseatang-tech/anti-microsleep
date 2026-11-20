@@ -1,0 +1,17 @@
+# ignore app cache folder
+.cache/
+roboflow_api_key.txt
+live_auth.json
+live_password.txt
+live_password_initial.txt
+company_api_key.txt
+truck_id.txt
+# backups made when updating files on the board, Python cache
+*.bak-*
+__pycache__/
+# downloaded / generated at runtime
+models/
+debug/
+data/
+maps/*.pmtiles
+maps/test_location.json

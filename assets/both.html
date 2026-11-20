@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anti Microsleep · ภาพสด + แผนที่</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f17; }
+  .wrap { display: flex; height: 100%; gap: 4px; }
+  iframe { border: 0; height: 100%; background: #0b0f17; }
+  #live { flex: 3; }
+  #map  { flex: 2; min-width: 320px; }
+  /* phone / narrow: stack, live feed on top */
+  @media (max-width: 800px) {
+    .wrap { flex-direction: column; }
+    iframe { width: 100%; }
+    #live { flex: 1; }
+    #map  { flex: 1; min-width: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <iframe id="live" src="/" title="ภาพสด"></iframe>
+  <iframe id="map" src="/driver.html" title="แผนที่คนขับ"></iframe>
+</div>
+</body>
+</html>

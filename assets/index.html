@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anti Microsleep Live</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #181c22; --line: #262c35; --text: #e7eaee; --muted: #8b95a3;
+    --ok: #3fb96b; --warn: #f0b429; --alarm: #ef4444; --info: #4ea1ff; --accent: #4ea1ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  header .conn { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 16px; padding: 16px; max-width: 1280px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 12px 16px; } }
+  .video { position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 4 / 3; border: 3px solid var(--line); transition: border-color .2s; }
+  .video img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .video .banner { position: absolute; top: 10px; left: 10px; padding: 6px 12px; border-radius: 8px; font-weight: 700; font-size: 15px; background: rgba(0,0,0,.6); }
+  .video .placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); text-align: center; padding: 16px; }
+  .video.l0 { border-color: var(--ok); } .video.l1 { border-color: var(--warn); }
+  .video.l2 { border-color: var(--alarm); animation: flash .4s steps(1) infinite; }
+  @keyframes flash { 50% { border-color: transparent; } }
+  .side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .card h2 { margin: 0 0 8px; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+  .level { font-size: 28px; font-weight: 800; }
+  .level.l0 { color: var(--ok); } .level.l1 { color: var(--warn); } .level.l2 { color: var(--alarm); }
+  .sub { color: var(--muted); font-size: 13px; }
+  .reasons { margin-top: 4px; color: var(--warn); font-size: 13px; min-height: 18px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 6px 0 4px; }
+  .val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; height: 8px; background: #0b0e12; border-radius: 4px; overflow: visible; }
+  .bar .fill { height: 100%; border-radius: 4px; background: var(--accent); width: 0; transition: width .15s; }
+  .bar .mark { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--text); opacity: .7; }
+  .bar .mark.w { background: var(--warn); } .bar .mark.a { background: var(--alarm); }
+  canvas { width: 100%; height: 110px; display: block; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
+  .k { color: var(--muted); font-size: 12px; } .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  button { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--accent); background: transparent; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { background: rgba(78,161,255,.1); }
+  button:disabled { opacity: .5; cursor: default; }
+  input.txt { width: 100%; min-width: 0; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line); background: #0b0e12; color: var(--text); font: inherit; }
+  #login { position: fixed; inset: 0; z-index: 10; display: none; place-items: center; background: var(--bg); padding: 16px; }
+  #login form { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 10px; }
+  #login h2 { margin: 0; font-size: 18px; }
+  #loginMsg { color: var(--alarm); min-height: 18px; font-size: 13px; }
+  #logout { width: auto; padding: 4px 10px; font-size: 12px; margin-left: 8px; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form id="loginForm">
+    <h2>🔒 ANTI MICROSLEEP · Live</h2>
+    <div class="sub">หน้านี้แสดงภาพหน้าคนขับ ต้องใส่รหัสผ่านก่อน</div>
+    <input class="txt" id="loginPw" type="password" autocomplete="current-password" placeholder="รหัสผ่าน" required>
+    <button type="submit" id="loginBtn">เข้าสู่ระบบ</button>
+    <div id="loginMsg"></div>
+  </form>
+</div>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>ANTI MICROSLEEP · Live</h1>
+  <span class="conn" id="conn">กำลังเชื่อมต่อ…</span>
+  <button id="logout">ออกจากระบบ</button>
+</header>
+<main>
+  <section>
+    <div class="video" id="video">
+      <img id="feed" alt="Camera live view">
+      <div class="placeholder" id="placeholder">รอภาพจากกล้อง…</div>
+      <div class="banner" id="banner">—</div>
+    </div>
+  </section>
+  <section class="side">
+    <div class="card">
+      <h2>สถานะ</h2>
+      <div class="level" id="level">—</div>
+      <div class="sub" id="status">—</div>
+      <div class="reasons" id="reasons"></div>
+    </div>
+    <div class="card">
+      <h2>ตา (EAR)</h2>
+      <div class="row"><span class="val" id="ear">—</span><span class="sub" id="closed">ลืมตา</span></div>
+      <div class="bar"><div class="fill" id="earFill"></div><div class="mark" id="earMark"></div></div>
+      <canvas id="chart" width="600" height="220"></canvas>
+      <div class="sub">เส้นประ = เกณฑ์ตาปิด · 30 วินาทีล่าสุด</div>
+    </div>
+    <div class="card">
+      <h2>PERCLOS (% เวลาตาปิด ใน 60 วิ)</h2>
+      <div class="row"><span class="val" id="perclos">—</span><span class="sub" id="pLegend">—</span></div>
+      <div class="bar"><div class="fill" id="pFill"></div><div class="mark w" id="pWarn"></div><div class="mark a" id="pAlarm"></div></div>
+    </div>
+    <div class="card grid2">
+      <div><div class="k">หาว (5 นาที)</div><div class="v" id="yawns">—</div></div>
+      <div><div class="k">ปาก (MAR)</div><div class="v" id="mar">—</div></div>
+      <div><div class="k">ความสว่าง</div><div class="v" id="light">—</div></div>
+      <div><div class="k">ความมั่นใจกล้อง</div><div class="v" id="conf">—</div></div>
+      <div><div class="k">FPS</div><div class="v" id="fps">—</div></div>
+      <div><div class="k">เกณฑ์ตาปิด</div><div class="v" id="thr">—</div></div>
+      <div><div class="k">หันหน้า</div><div class="v" id="yaw">—</div></div>
+      <div><div class="k">ศีรษะ (ก้ม / เอียง)</div><div class="v" id="head">—</div></div>
+      <div><div class="k">เรียนรู้ตาคนขับ</div><div class="v" id="cal">—</div></div>
+      <div><div class="k">AI ตา (Roboflow)</div><div class="v" id="ai">—</div></div>
+      <div><div class="k">AI สถานะ</div><div class="v" id="aiStatus">—</div></div>
+    </div>
+    <button id="recal">รีเซ็ต (ล้าง PERCLOS + เรียนรู้ตาใหม่)</button>
+    <div class="card">
+      <h2>Roboflow API key</h2>
+      <div style="display:flex; gap:8px">
+        <input id="rfKey" type="password" autocomplete="off" placeholder="วาง API key ที่นี่"
+               style="flex:1; min-width:0; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:#0b0e12; color:var(--text); font:inherit">
+        <button id="rfSave" style="width:auto; padding:9px 14px">บันทึก</button>
+      </div>
+      <div class="sub" id="rfMsg" style="margin-top:6px">key จะถูกเก็บบนบอร์ดเท่านั้น และจะไม่แสดงกลับมา</div>
+    </div>
+    <div class="card">
+      <h2>เปลี่ยนรหัสผ่านหน้านี้</h2>
+      <form id="pwForm" style="display:flex; flex-direction:column; gap:8px">
+        <input class="txt" id="pwOld" type="password" autocomplete="current-password" placeholder="รหัสเดิม" required>
+        <input class="txt" id="pwNew" type="password" autocomplete="new-password" placeholder="รหัสใหม่ (อย่างน้อย 6 ตัว)" minlength="6" required>
+        <button type="submit" id="pwSave">เปลี่ยนรหัส</button>
+      </form>
+      <div class="sub" id="pwMsg" style="margin-top:6px">เปลี่ยนแล้ว เครื่องอื่นที่ล็อกอินไว้จะต้องใส่รหัสใหม่</div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const LEVEL_TH = ["ปกติ", "เตือน", "อันตราย!"];
+const STATUS_TH = { OK: "เจอใบหน้า ทำงานปกติ", CALIBRATING: "กำลังปรับเกณฑ์… มองกล้อง ลืมตาปกติ",
+  NO_CAMERA: "ไม่พบกล้อง", NO_FACE: "ไม่เห็นใบหน้า", LOW_LIGHT: "มืดเกินไปสำหรับกล้อง" };
+const hist = [];      // [time, ear, thr]
+let lastOk = 0, wasOn = true, authed = false;
+
+const feed = $("feed");
+feed.onload = () => { $("placeholder").style.display = "none"; };
+feed.onerror = () => { $("placeholder").style.display = "grid";
+  setTimeout(() => { if (authed) feed.src = "stream?" + Date.now(); }, 2000); };
+
+function showLogin(msg) {
+  authed = false;
+  feed.removeAttribute("src");
+  $("login").style.display = "grid";
+  $("loginMsg").textContent = msg || "";
+  $("loginPw").focus();
+}
+
+function startLive() {
+  authed = true;
+  $("login").style.display = "none";
+  feed.src = "stream?" + Date.now();
+}
+
+$("loginForm").onsubmit = async ev => {
+  ev.preventDefault();
+  $("loginBtn").disabled = true;
+  try {
+    const r = await fetch("api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: $("loginPw").value }) });
+    const j = await r.json();
+    if (j.ok) { $("loginPw").value = ""; startLive(); }
+    else $("loginMsg").textContent = j.error || "เข้าสู่ระบบไม่สำเร็จ";
+  } catch (e) { $("loginMsg").textContent = "เชื่อมต่อบอร์ดไม่ได้"; }
+  $("loginBtn").disabled = false;
+};
+
+$("logout").onclick = async () => {
+  try { await fetch("api/logout", { method: "POST" }); } catch (e) {}
+  showLogin();
+};
+
+const fmt = (v, d = 3) => v == null ? "—" : Number(v).toFixed(d);
+
+async function poll() {
+  try {
+    const r = await fetch("api/stats", { cache: "no-store" });
+    if (r.status === 401) { if (authed || $("login").style.display !== "grid") showLogin(); throw 0; }
+    if (!authed) startLive();
+    const s = await r.json();
+    lastOk = Date.now();
+    render(s);
+  } catch (e) { /* offline */ }
+  const on = Date.now() - lastOk < 2000;
+  if (on && !wasOn && authed) feed.src = "stream?" + Date.now();   // board came back: reconnect video
+  wasOn = on;
+  $("dot").classList.toggle("on", on);
+  $("conn").textContent = on ? "เชื่อมต่อแล้ว" : "ขาดการเชื่อมต่อ";
+  setTimeout(poll, 250);
+}
+
+function render(s) {
+  const lv = s.level_num ?? 0;
+  $("level").textContent = LEVEL_TH[lv]; $("level").className = "level l" + lv;
+  $("video").className = "video l" + lv;
+  $("banner").textContent = LEVEL_TH[lv] + (s.status && s.status !== "OK" ? " · " + s.status : "");
+  $("banner").style.color = ["var(--ok)", "var(--warn)", "var(--alarm)"][lv];
+  $("status").textContent = STATUS_TH[s.status] || s.status || "—";
+  $("reasons").textContent = (s.reasons || []).join(" · ");
+
+  const thr = s.ear_threshold;
+  $("ear").textContent = fmt(s.ear);
+  $("thr").textContent = fmt(thr);
+  const closedFor = s.closed_for || 0;
+  $("closed").textContent = s.ear == null ? "—"
+    : closedFor > 0 ? `หลับตา ${closedFor.toFixed(1)} วิ`
+    : s.smiling && s.squint ? "ยิ้ม/หัวเราะ (ไม่นับ)"
+    : s.squint ? "หรี่ตา (ไม่นับ)" : "ลืมตา";
+  $("closed").style.color = closedFor >= 2 ? "var(--alarm)" : closedFor >= 1 ? "var(--warn)" : "";
+  const scale = v => Math.max(0, Math.min(100, v / 0.4 * 100));
+  $("earFill").style.width = s.ear == null ? "0" : scale(s.ear) + "%";
+  $("earFill").style.background = s.ear != null && thr && s.ear < thr ? "var(--alarm)" : "var(--accent)";
+  if (thr) $("earMark").style.left = scale(thr) + "%";
+
+  const p = s.perclos;
+  $("perclos").textContent = p == null ? "รอข้อมูล…" : (p * 100).toFixed(0) + "%";
+  const pw = s.perclos_warn ?? 0.20, pa = s.perclos_alarm ?? 0.35;
+  const pScale = v => Math.min(100, v * 200);              // bar spans 0–50 %
+  $("pFill").style.width = p == null ? "0" : pScale(p) + "%";
+  $("pFill").style.background = p >= pa ? "var(--alarm)" : p >= pw ? "var(--warn)" : "var(--ok)";
+  $("pWarn").style.left = pScale(pw) + "%";
+  $("pAlarm").style.left = pScale(pa) + "%";
+  $("pLegend").textContent = `เตือนเมื่อ ≥${Math.round(pw * 100)}% · ≥${Math.round(pa * 100)}% = ง่วงมาก`;
+
+  $("yawns").textContent = s.yawns ?? "—";
+  $("mar").textContent = fmt(s.mar, 2);
+  $("light").textContent = s.brightness == null ? "—" : Math.round(s.brightness);
+  $("conf").textContent = s.cam_conf == null ? "—" : Math.round(s.cam_conf * 100) + "%";
+  $("fps").textContent = fmt(s.fps, 1);
+  $("yaw").textContent = s.yaw == null ? "—" : (s.looking_away ? "หันออก " : "ตรง ") + "(" + s.yaw.toFixed(2) + ")";
+  $("yaw").style.color = s.looking_away ? "var(--warn)" : "";
+  $("cal").textContent = s.calibrated ? "เรียนรู้แล้ว" : "กำลังเรียนรู้…";
+  const pd = s.pitch_delta, rd = s.roll_delta;
+  $("head").textContent = rd == null ? "—"
+    : (s.head_down ? "ก้ม! " : s.head_tilt ? "เอียง! " : "ปกติ ")
+      + `(${pd == null ? "?" : (pd > 0 ? "+" : "") + Math.round(pd)}° / ${Math.round(rd)}°)`;
+  $("head").style.color = s.head_down || s.head_tilt ? "var(--warn)" : "";
+  const aiTh = { open: "ลืมตา", closed: "หลับตา" };
+  const note = s.ai_note === "veto" ? " · ยกเลิกตาปิดผิด" : "";
+  $("ai").textContent = s.ai ? `${aiTh[s.ai]} ${Math.round((s.ai_conf || 0) * 100)}%${note}` : "—";
+  $("ai").style.color = s.ai === "closed" ? "var(--warn)" : "";
+  const st = s.ai_status || "—";
+  $("aiStatus").textContent = st === "ok" ? `ทำงาน · ${Math.round((s.ai_latency || 0) * 1000)} ms · ${s.ai_calls} ครั้ง`
+    : st.startsWith("off") ? "ปิด (ไม่มี API key)" : st === "offline" ? "ออฟไลน์ (ใช้ EAR อย่างเดียว)" : st;
+
+  const now = Date.now() / 1000;
+  hist.push([now, s.ear, thr]);
+  while (hist.length && now - hist[0][0] > 30) hist.shift();
+  drawChart(now);
+}
+
+function drawChart(now) {
+  const c = $("chart"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  const y = v => H - (Math.min(v, 0.4) / 0.4) * (H - 10) - 5;
+  const x = t => W - ((now - t) / 30) * W;
+  g.strokeStyle = "#262c35"; g.lineWidth = 1;
+  for (const v of [0.1, 0.2, 0.3]) { g.beginPath(); g.moveTo(0, y(v)); g.lineTo(W, y(v)); g.stroke(); }
+  const last = hist.length ? hist[hist.length - 1][2] : null;
+  if (last) { g.setLineDash([8, 6]); g.strokeStyle = "#ef4444"; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(0, y(last)); g.lineTo(W, y(last)); g.stroke(); g.setLineDash([]); }
+  g.strokeStyle = "#4ea1ff"; g.lineWidth = 3; g.beginPath();
+  let pen = false;
+  for (const [t, e] of hist) {
+    if (e == null) { pen = false; continue; }
+    pen ? g.lineTo(x(t), y(e)) : g.moveTo(x(t), y(e)); pen = true;
+  }
+  g.stroke();
+}
+
+$("recal").onclick = async () => {
+  $("recal").disabled = true;
+  try { await fetch("api/recalibrate", { method: "POST" }); } catch (e) {}
+  setTimeout(() => $("recal").disabled = false, 2000);
+};
+
+$("rfSave").onclick = async () => {
+  const key = $("rfKey").value.trim();
+  if (!key) { $("rfMsg").textContent = "กรุณาวาง key ก่อน"; return; }
+  $("rfSave").disabled = true;
+  try {
+    const r = await fetch("api/roboflow_key", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key }) });
+    const j = await r.json();
+    $("rfMsg").textContent = j.ok ? "บันทึกแล้ว ✓ AI กำลังเริ่มทำงาน (ดูช่อง AI สถานะ)" : ("ผิดพลาด: " + (j.error || r.status));
+    if (j.ok) $("rfKey").value = "";
+  } catch (e) { $("rfMsg").textContent = "ส่งไม่สำเร็จ: " + e; }
+  $("rfSave").disabled = false;
+};
+
+$("pwForm").onsubmit = async ev => {
+  ev.preventDefault();
+  $("pwSave").disabled = true;
+  try {
+    const r = await fetch("api/password", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old: $("pwOld").value, new: $("pwNew").value }) });
+    const j = await r.json();
+    $("pwMsg").textContent = j.ok ? "เปลี่ยนรหัสแล้ว ✓" : ("ผิดพลาด: " + (j.error || r.status));
+    if (j.ok) { $("pwOld").value = ""; $("pwNew").value = ""; }
+  } catch (e) { $("pwMsg").textContent = "ส่งไม่สำเร็จ: " + e; }
+  $("pwSave").disabled = false;
+};
+
+poll();
+</script>
+</body>
+</html>

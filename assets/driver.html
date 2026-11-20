@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1216">
+<title>Anti Microsleep · คนขับ</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+  :root {
+    --bg: #0f1216; --panel: #181c22; --panel2: #20252d; --line: #2a313b; --text: #e7eaee; --muted: #8b95a3;
+    --ok: #3fb96b; --warn: #f0b429; --alarm: #ef4444; --info: #4ea1ff;
+    --fuel: #f97316; --rest: #22c55e; --cafe: #a78bfa;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); overflow: hidden;
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", sans-serif; }
+
+  #map { position: fixed; inset: 0; background: #1b2027; }
+  .leaflet-container { background: #1b2027; font: inherit; }
+  .leaflet-control-attribution { background: rgba(15,18,22,.7) !important; color: var(--muted) !important; font-size: 10px; }
+  .leaflet-control-attribution a { color: var(--muted) !important; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--panel); color: var(--text); }
+  .leaflet-popup-content { margin: 10px 12px; font-size: 15px; }
+  .leaflet-popup-content a { color: var(--info); font-weight: 700; }
+
+  /* top bar */
+  .top { position: fixed; top: 0; left: 0; right: 0; z-index: 1000; display: flex; align-items: center; gap: 8px;
+         padding: calc(env(safe-area-inset-top) + 10px) 12px 10px; pointer-events: none; }
+  .pill { pointer-events: auto; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px;
+          background: rgba(24,28,34,.92); border: 1px solid var(--line); font-size: 15px; font-weight: 700;
+          backdrop-filter: blur(6px); }
+  .pill.small { font-size: 13px; font-weight: 600; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .spacer { flex: 1; }
+  .pill.lvl1 { border-color: var(--warn); color: var(--warn); }
+  .pill.lvl2 { border-color: var(--alarm); color: #fff; background: var(--alarm); }
+  .recenter { position: fixed; right: 12px; top: calc(env(safe-area-inset-top) + 62px); z-index: 1000; width: 48px; height: 48px; border-radius: 50%;
+              border: 1px solid var(--line); background: rgba(24,28,34,.95); color: var(--text); font-size: 22px;
+              display: grid; place-items: center; cursor: pointer; }
+  .testnote { position: fixed; left: 12px; right: 72px; top: calc(env(safe-area-inset-top) + 64px); z-index: 1000; font-size: 12px; color: var(--muted);
+              background: rgba(24,28,34,.9); border: 1px dashed var(--line); border-radius: 10px; padding: 6px 10px; }
+
+  /* red alarm flash over the whole screen */
+  #flash { position: fixed; inset: 0; z-index: 900; pointer-events: none; box-shadow: inset 0 0 0 0 transparent; }
+  #flash.l1 { box-shadow: inset 0 0 0 6px var(--warn); }
+  #flash.l2 { animation: flash .5s steps(1) infinite; }
+  @keyframes flash { 0% { box-shadow: inset 0 0 0 14px var(--alarm); background: rgba(239,68,68,.18); }
+                     50% { box-shadow: inset 0 0 0 0 transparent; background: transparent; } }
+
+  /* bottom sheet */
+  .sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000; background: var(--panel);
+           border-top: 1px solid var(--line); border-radius: 18px 18px 0 0;
+           padding: 8px 14px calc(env(safe-area-inset-bottom) + 12px); max-height: 82vh; overflow: auto;
+           box-shadow: 0 -8px 24px rgba(0,0,0,.4); }
+  .grab { width: 40px; height: 5px; border-radius: 3px; background: var(--line); margin: 0 auto 8px; }
+  .status { display: flex; align-items: center; gap: 10px; padding: 4px 2px 10px; }
+  .status .icon { font-size: 30px; line-height: 1; }
+  .status .big { font-size: 20px; font-weight: 800; }
+  .status .why { color: var(--muted); font-size: 14px; }
+  .status.l1 .big { color: var(--warn); } .status.l2 .big { color: var(--alarm); } .status.l0 .big { color: var(--ok); }
+  .status.off .big { color: var(--muted); }
+
+  .rest-msg { display: none; margin: 0 0 8px; padding: 8px 12px; border-radius: 12px; background: #2a2210;
+              border: 1px solid var(--warn); color: var(--warn); font-weight: 700; }
+  .rest-msg.show { display: block; }
+  .rest-msg.red { background: #2a1215; border-color: var(--alarm); color: #ffb4b4; }
+
+  .tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
+  .tab { padding: 8px 4px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel2);
+         color: var(--muted); font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
+  .tab.on { color: var(--text); border-color: var(--info); background: #1c2a3d; }
+
+  .stop { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 14px;
+          background: var(--panel2); border: 1px solid var(--line); }
+  .stop .e { font-size: 28px; }
+  .stop .name { font-weight: 800; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stop .dist { color: var(--muted); font-size: 14px; }
+  .stop .dist b { color: var(--text); font-size: 16px; }
+  .stop .info { flex: 1; min-width: 0; }
+  .go { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 58px; margin-top: 8px;
+        border-radius: 14px; border: 0; background: var(--info); color: #fff; font: inherit; font-size: 19px;
+        font-weight: 800; text-decoration: none; cursor: pointer; }
+  .go[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+
+  details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 8px; }
+  summary { cursor: pointer; color: var(--muted); font-weight: 700; font-size: 14px; padding: 6px 0; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::after { content: " ▾"; }
+  details[open] summary::after { content: " ▴"; }
+  .section-h { margin: 12px 0 6px; font-size: 13px; color: var(--muted); font-weight: 700; }
+  .shift-time { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .meter { height: 8px; background: #0b0e12; border-radius: 4px; margin: 8px 0 10px; overflow: hidden; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--ok); }
+  .meter i.due { background: var(--warn); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btn { min-height: 48px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+         font: inherit; font-size: 16px; font-weight: 700; cursor: pointer; width: 100%; }
+  .btn.primary { background: var(--info); border-color: var(--info); color: #fff; }
+  .btn.ghost { background: transparent; color: var(--muted); }
+  .counts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 6px; }
+  .count { border-radius: 12px; padding: 8px 12px; background: #0f1318; border: 1px solid var(--line); }
+  .count b { font-size: 22px; display: block; }
+  .count.y b { color: var(--warn); } .count.r b { color: var(--alarm); }
+  .count span { color: var(--muted); font-size: 13px; }
+  ul.events { list-style: none; margin: 0; padding: 0; }
+  ul.events li { display: flex; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); font-size: 14px; }
+  ul.events .t { color: var(--muted); width: 46px; flex: none; font-variant-numeric: tabular-nums; }
+  .foot { text-align: center; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .foot a { color: var(--muted); }
+
+  .truck { width: 34px; height: 34px; }
+  .truck svg { width: 34px; height: 34px; filter: drop-shadow(0 1px 3px rgba(0,0,0,.6)); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="flash"></div>
+
+<div class="top">
+  <div class="pill"><span class="dot" id="dot"></span><span id="title">ANTI MICROSLEEP</span></div>
+  <div class="spacer"></div>
+  <div class="pill small" id="gpsPill">GPS…</div>
+</div>
+<button class="recenter" id="recenter" title="กลับไปที่รถ" aria-label="กลับไปที่รถ">◎</button>
+<div class="testnote" id="testnote" hidden>ตำแหน่งทดสอบ (ยังไม่มี GPS) · กดค้างบนแผนที่เพื่อย้ายตำแหน่ง</div>
+
+<section class="sheet" id="sheet">
+  <div class="grab"></div>
+  <div class="status l0" id="status">
+    <div class="icon" id="icon">⏳</div>
+    <div><div class="big" id="big">กำลังเชื่อมต่อ…</div><div class="why" id="why"></div></div>
+  </div>
+  <div class="rest-msg" id="restMsg"></div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab on" data-type="fuel">⛽ ปั๊มน้ำมัน</button>
+    <button class="tab" data-type="rest_area">🅿️ จุดพักรถ</button>
+    <button class="tab" data-type="cafe">☕ ร้านกาแฟ</button>
+  </div>
+  <div class="stop">
+    <div class="e" id="stopIcon">⛽</div>
+    <div class="info">
+      <div class="name" id="stopName">กำลังค้นหา…</div>
+      <div class="dist" id="stopDist"></div>
+    </div>
+  </div>
+  <a class="go" id="go" target="_blank" rel="noopener" aria-disabled="true">🧭 นำทางไปที่นี่</a>
+
+  <details id="more">
+    <summary>เวลาขับ · การเตือนวันนี้</summary>
+    <div class="section-h">เวลาขับ (ตั้งแต่พักครั้งล่าสุด)</div>
+    <div id="shiftOff">
+      <div class="sub" style="margin-bottom:8px">ยังไม่ได้เริ่มกะ</div>
+      <button class="btn primary" id="startBtn">▶️ เริ่มกะ</button>
+    </div>
+    <div id="shiftOn" hidden>
+      <div class="shift-time" id="drive">0:00</div>
+      <div class="sub" id="shiftSub"></div>
+      <div class="meter"><i id="meter"></i></div>
+      <div class="row2">
+        <button class="btn" id="breakBtn">☕ พักแล้ว</button>
+        <button class="btn ghost" id="endBtn">จบกะ</button>
+      </div>
+    </div>
+    <div class="section-h">การเตือนวันนี้</div>
+    <div class="counts">
+      <div class="count y"><b id="nWarn">0</b><span>🟡 เตือน</span></div>
+      <div class="count r"><b id="nAlarm">0</b><span>🔴 อันตราย</span></div>
+    </div>
+    <ul class="events" id="events"></ul>
+    <div class="sub" id="noEvents">ยังไม่มีการเตือนวันนี้ 👍</div>
+    <div class="foot"><a href="/">หน้าจอสำหรับช่าง (ภาพกล้อง)</a></div>
+  </details>
+</section>
+
+<script src="vendor/leaflet.js"></script>
+<script src="vendor/protomaps-leaflet.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const TYPE_ICON = { fuel: "⛽", rest_area: "🅿️", cafe: "☕" };
+const TYPE_NAME = { fuel: "ปั๊มน้ำมัน", rest_area: "จุดพักรถ", cafe: "ร้านกาแฟ" };
+const TYPE_COLOR = { fuel: "#f97316", rest_area: "#22c55e", cafe: "#a78bfa" };
+const TYPES = ["fuel", "rest_area", "cafe"];
+
+// ------------------------------------------------------------------ map
+// offline map data stops at zoom 14 (thailand.pmtiles); deeper zooms stretch zoom-14 data
+const MAP_DATA_MAX_ZOOM = 14;
+const map = L.map("map", { zoomControl: false, attributionControl: true, maxZoom: 18 }).setView([13.7563, 100.5018], 13);
+let baseLayer = null;
+function setBase(offline) {
+  if (baseLayer && baseLayer._offline === offline) return;
+  if (baseLayer) map.removeLayer(baseLayer);
+  if (offline) {
+    baseLayer = protomapsL.leafletLayer({ url: "/maps/thailand.pmtiles", flavor: "dark", lang: "th",
+      maxDataZoom: MAP_DATA_MAX_ZOOM, maxZoom: 18,
+      attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a> · Protomaps' });
+  } else {
+    // no offline map installed yet: online map tiles (needs signal)
+    baseLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { maxZoom: 19, attribution: '© <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>' });
+  }
+  baseLayer._offline = offline;
+  baseLayer.addTo(map);
+}
+
+const truckIcon = (course) => L.divIcon({ className: "truck", iconSize: [34, 34], iconAnchor: [17, 17], html:
+  `<svg viewBox="0 0 34 34"><circle cx="17" cy="17" r="15" fill="#4ea1ff" stroke="#fff" stroke-width="3"/>` +
+  (course == null ? `<circle cx="17" cy="17" r="5" fill="#fff"/>`
+   : `<path d="M17 6 L24 24 L17 20 L10 24 Z" fill="#fff" transform="rotate(${course} 17 17)"/>`) + `</svg>` });
+let truck = null, follow = true, lastLoc = null;
+map.on("dragstart", () => { follow = false; });
+$("recenter").onclick = () => { follow = true; if (lastLoc) map.setView([lastLoc.lat, lastLoc.lon], Math.max(map.getZoom(), 14)); };
+
+// rest-stop markers for the visible area
+const poiLayer = L.layerGroup().addTo(map);
+let poiTimer = null;
+function loadPois() {
+  clearTimeout(poiTimer);
+  poiTimer = setTimeout(async () => {
+    if (map.getZoom() < 11) { poiLayer.clearLayers(); return; }
+    const b = map.getBounds();
+    try {
+      const r = await fetch(`/api/pois?s=${b.getSouth()}&w=${b.getWest()}&n=${b.getNorth()}&e=${b.getEast()}`);
+      const d = await r.json();
+      poiLayer.clearLayers();
+      for (const [lat, lon, k, name] of d.pois || []) {
+        const t = TYPES[k];
+        if (t !== selType) continue;                 // only the selected kind of stop
+        L.circleMarker([lat, lon], { radius: 7, color: "#0f1216", weight: 2, fillColor: TYPE_COLOR[t], fillOpacity: 1 })
+          .bindPopup(`${TYPE_ICON[t]} <b>${esc(name || TYPE_NAME[t])}</b><br><a target="_blank" rel="noopener" href="${navUrl(lat, lon)}">🧭 นำทาง</a>`)
+          .addTo(poiLayer);
+      }
+    } catch (e) {}
+  }, 250);
+}
+map.on("moveend", loadPois);
+
+// long-press (or right-click) moves the TEST location while there is no GPS
+map.on("contextmenu", async (e) => {
+  if (!lastLoc || lastLoc.source === "gps") return;
+  if (!confirm("ย้ายตำแหน่งทดสอบมาที่นี่?")) return;
+  await post("/api/test_location", { lat: e.latlng.lat, lon: e.latlng.lng });
+  follow = true; pollNav(true);
+});
+
+// nearest-stop highlight
+let selType = "fuel", nav = null, nearestMarker = null, nearestLine = null, routeLine = null;
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  selType = b.dataset.type; userPicked = true;
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === b));
+  renderStop(); loadPois();
+});
+let userPicked = false;
+
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+// With real GPS, Google Maps starts from the phone's own location (live navigation).
+// With the test location (no GPS), start Google Maps from that same spot so the routes compare.
+const navUrl = (lat, lon) => {
+  const l = nav && nav.loc;
+  const origin = l && l.source === "test" && l.lat != null ? `&origin=${l.lat},${l.lon}` : "";
+  return `https://www.google.com/maps/dir/?api=1${origin}&destination=${lat},${lon}&travelmode=driving`;
+};
+function fmtKm(m) { return m == null ? "-" : m < 1000 ? `${Math.round(m / 10) * 10} ม.` : `${(m / 1000).toFixed(m < 10000 ? 1 : 0)} กม.`; }
+function fmtMin(s) { return s == null ? "" : ` · ~${Math.max(1, Math.round(s / 60))} นาที`; }
+
+function renderStop() {
+  const n = nav && nav.nearest ? nav.nearest[selType] : null;
+  $("stopIcon").textContent = TYPE_ICON[selType];
+  if (nearestMarker) { map.removeLayer(nearestMarker); nearestMarker = null; }
+  if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
+  if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+  if (!nav || !nav.loc || nav.loc.lat == null) {
+    $("stopName").textContent = "ยังไม่รู้ตำแหน่งรถ"; $("stopDist").textContent = "รอสัญญาณ GPS…";
+    $("go").setAttribute("aria-disabled", "true"); return;
+  }
+  if (!n) {
+    $("stopName").textContent = `ไม่พบ${TYPE_NAME[selType]}ใกล้ ๆ`; $("stopDist").textContent = "";
+    $("go").setAttribute("aria-disabled", "true"); return;
+  }
+  $("stopName").textContent = n.name || TYPE_NAME[selType];
+  const where = (n.ahead === true ? " · อยู่ข้างหน้า" : n.ahead === false ? " · อยู่ด้านหลัง" : "")
+    + (n.side === "same" ? " · ฝั่งเดียวกัน" : n.side === "opposite" ? " · ฝั่งตรงข้าม (ต้องกลับรถ)" : "");
+  $("stopDist").innerHTML = n.road_m != null
+    ? `<b>${fmtKm(n.road_m)}</b> ตามถนน${fmtMin(n.road_s)}${where}`
+    : n.off_road
+      ? `<b>~${fmtKm(n.straight_m)}</b> (เส้นตรง · ไม่มีถนนเส้นนี้ในแผนที่ กด 🧭 นำทาง)${where}`
+      : `<b>${fmtKm(n.straight_m)}</b> (เส้นตรง)${where}`;
+  $("go").href = navUrl(n.lat, n.lon);
+  $("go").setAttribute("aria-disabled", "false");
+  nearestMarker = L.circleMarker([n.lat, n.lon], { radius: 12, color: "#fff", weight: 3, fillColor: TYPE_COLOR[selType], fillOpacity: 1 })
+    .bindPopup(`${TYPE_ICON[selType]} <b>${esc(n.name || TYPE_NAME[selType])}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
+    .addTo(map);
+  const here = [nav.loc.lat, nav.loc.lon];
+  if (n.route && n.route.length > 1) {
+    // road route like Google Maps: blue line with a dark casing, drawn under the markers
+    const path = n.route;
+    routeLine = L.layerGroup([
+      L.polyline(path, { color: "#0b3d91", weight: 10, opacity: .9, lineCap: "round", lineJoin: "round", interactive: false }),
+      L.polyline(path, { color: "#4b8df8", weight: 6, opacity: 1, lineCap: "round", lineJoin: "round", interactive: false }),
+      // short dotted links: truck -> where the route joins the road, road -> the stop
+      L.polyline([here, path[0]], { color: "#4b8df8", weight: 3, dashArray: "2 6", opacity: .9, interactive: false }),
+      L.polyline([path[path.length - 1], [n.lat, n.lon]], { color: "#4b8df8", weight: 3, dashArray: "2 6", opacity: .9, interactive: false }),
+    ]).addTo(map);
+    nearestMarker.bringToFront();
+  } else {
+    // no road router: straight dashed line
+    nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[selType], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
+  }
+}
+
+async function pollNav(once) {
+  try {
+    const r = await fetch("/api/nav", { cache: "no-store" });
+    nav = await r.json();
+    setBase(!!nav.offline_map);
+    const loc = nav.loc;
+    const gpsTxt = loc.source === "gps" ? `GPS ✓ ${loc.sats || 0} ดวง${loc.speed != null ? " · " + Math.round(loc.speed) + " กม./ชม." : ""}`
+      : loc.gps === 0 ? `GPS กำลังหาดาวเทียม (${loc.sats || 0})` : "ไม่มี GPS";
+    $("gpsPill").textContent = gpsTxt;
+    $("testnote").hidden = loc.source !== "test";
+    if (loc.lat != null) {
+      const first = !lastLoc;
+      lastLoc = loc;
+      const ll = [loc.lat, loc.lon];
+      if (!truck) truck = L.marker(ll, { icon: truckIcon(loc.course), zIndexOffset: 1000 }).addTo(map);
+      else { truck.setLatLng(ll); truck.setIcon(truckIcon(loc.course)); }
+      if (follow) map.setView(ll, first ? 14 : map.getZoom(), { animate: !first });
+      if (first) loadPois();
+    }
+    renderStop();
+  } catch (e) {}
+  if (!once) setTimeout(pollNav, 2000);
+}
+
+// ------------------------------------------------------------------ drowsiness status, shift, alerts
+const TH = [
+  [/^microsleep ([\d.]+)s/, (m) => `หลับใน ${m[1]} วินาที`],
+  [/^eyes closed (\d+)% of last 2s/, () => "หลับตาบ่อยมาก"],
+  [/^eyes closed ([\d.]+)s/, (m) => `หลับตา ${m[1]} วินาที`],
+  [/^PERCLOS (\d+)%( \(very drowsy\))?/, (m) => m[2] ? "ง่วงมาก (หลับตาบ่อย)" : "เริ่มง่วง (หลับตาบ่อย)"],
+  [/^(\d+) yawns/, (m) => `หาว ${m[1]} ครั้งใน 5 นาที`],
+  [/^face not visible/, () => "มองไม่เห็นใบหน้า"],
+  [/^head dropped, face hidden (\d+)s/, (m) => `หัวตก ${m[1]} วินาที`],
+  [/^head dropped (\d+)s/, (m) => `หัวตก ${m[1]} วินาที`],
+  [/^heavy eyelids (\d+)s/, () => "ตาหนัก ลืมตาไม่ขึ้น"],
+  [/^head down \+ eyes closed/, () => "ก้มหัว + หลับตา"],
+  [/^head tilted \+ eyes closed/, () => "เอียงหัว + หลับตา"],
+  [/^head down (\d+)s/, (m) => `ก้มหัว ${m[1]} วินาที`],
+  [/^head tilted (\d+)s/, (m) => `เอียงหัว ${m[1]} วินาที`],
+  [/^looking away (\d+)s/, (m) => `ไม่มองถนน ${m[1]} วินาที`],
+];
+const th = (r) => { for (const [re, f] of TH) { const m = r.match(re); if (m) return f(m); } return r; };
+const thAll = (rs) => (rs || []).map(th).join(" · ");
+const onlyNoFace = (ev) => ev.reasons.length > 0 && ev.reasons.every(r => r.startsWith("face not visible"));
+const STATUS_TEXT = { NO_CAMERA: ["📷", "ไม่พบกล้อง", "ตรวจสายกล้อง"], LOW_LIGHT: ["🌙", "มืดเกินไป", "กล้องมองไม่เห็น"],
+                      NO_FACE: ["👤", "ไม่เห็นใบหน้า", "นั่งหันหน้าเข้ากล้อง"] };
+const LEVEL_TEXT = [["🟢", "ปกติ"], ["🟡", "เริ่มง่วง ระวัง!"], ["🔴", "อันตราย! ตื่น!"]];
+const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 3600)}:${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}`; };
+const fmtClock = (t) => new Date(t * 1000).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" });
+
+let state = null, lastOk = 0;
+function render() {
+  const d = state; if (!d) return;
+  $("title").textContent = `รถคันที่ ${d.truck}`;
+  let icon, big, why;
+  if (d.level > 0) { [icon, big] = LEVEL_TEXT[d.level]; why = thAll(d.reasons); }
+  else if (STATUS_TEXT[d.status]) { [icon, big, why] = STATUS_TEXT[d.status]; }
+  else { [icon, big] = LEVEL_TEXT[0]; why = d.status === "CALIBRATING" ? "กำลังเรียนรู้ใบหน้า…" : "ตื่นดี"; }
+  $("status").className = "status " + (d.level > 0 ? "l" + d.level : STATUS_TEXT[d.status] ? "off" : "l0");
+  $("icon").textContent = icon; $("big").textContent = big; $("why").textContent = why;
+  $("flash").className = d.level ? "l" + d.level : "";
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const evs = (d.events || []).filter(e => e.t * 1000 >= today.getTime() && !onlyNoFace(e)).reverse();
+  $("nWarn").textContent = evs.filter(e => e.level === 1).length;
+  $("nAlarm").textContent = evs.filter(e => e.level === 2).length;
+  $("noEvents").hidden = evs.length > 0;
+  $("events").innerHTML = "";
+  for (const e of evs.slice(0, 50)) {
+    const li = document.createElement("li");
+    const t = document.createElement("span"); t.className = "t"; t.textContent = fmtClock(e.t);
+    const w = document.createElement("span"); w.textContent = (e.level === 2 ? "🔴 " : "🟡 ") + thAll(e.reasons);
+    li.append(t, w); $("events").append(li);
+  }
+
+  const on = !!d.shift_start; let breakDue = false;
+  $("shiftOff").hidden = on; $("shiftOn").hidden = !on;
+  if (on) {
+    const since = d.now - (d.last_break || d.shift_start);
+    breakDue = since >= d.break_every_s;
+    $("drive").textContent = fmtDur(since);
+    $("shiftSub").textContent = breakDue ? "⚠️ ขับนานแล้ว ควรพัก 15 นาที" : `เริ่มกะ ${fmtClock(d.shift_start)} · ควรพักทุก ${d.break_every_s / 3600} ชม.`;
+    $("meter").style.width = Math.min(100, since / d.break_every_s * 100) + "%";
+    $("meter").className = breakDue ? "due" : "";
+  }
+
+  // tired -> suggest a rest stop and switch the card to rest areas (unless the driver picked a tab)
+  const recent = (sec) => evs.filter(e => d.now - e.t <= sec);
+  const red = d.level === 2 || recent(900).some(e => e.level === 2);
+  const many = recent(3600).length >= 3;
+  const show = red || many || breakDue;
+  $("restMsg").className = "rest-msg" + (show ? " show" : "") + (red ? " red" : "");
+  $("restMsg").textContent = red ? "😴 คุณหลับใน! แวะพักที่ใกล้ที่สุดก่อนนะ" : many ? "😴 คุณเริ่มง่วงบ่อยแล้ว แวะพักก่อนนะ" : "⏰ ขับนานแล้ว ถึงเวลาพัก";
+  if (show && !userPicked && selType !== "rest_area" && nav && nav.nearest && nav.nearest.rest_area) {
+    selType = "rest_area";
+    document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.dataset.type === selType));
+    renderStop(); loadPois();
+  }
+}
+
+async function pollDriver() {
+  try {
+    const r = await fetch("/api/driver", { cache: "no-store" });
+    state = await r.json(); lastOk = Date.now(); render();
+  } catch (e) {}
+  const alive = Date.now() - lastOk < 4000;
+  $("dot").classList.toggle("on", alive);
+  if (!alive && !state) { $("big").textContent = "เชื่อมต่อบอร์ดไม่ได้"; $("why").textContent = "ตรวจว่าเปิดฮอตสปอต AMS อยู่"; }
+  setTimeout(pollDriver, 1000);
+}
+async function post(url, body) {
+  try { await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch (e) {}
+}
+$("startBtn").onclick = () => post("/api/shift", { action: "start" });
+$("breakBtn").onclick = () => post("/api/shift", { action: "break" });
+$("endBtn").onclick = () => { if (confirm("จบกะตอนนี้?")) post("/api/shift", { action: "end" }); };
+
+pollDriver();
+pollNav();
+</script>
+</body>
+</html>
