@@ -49,9 +49,11 @@ FPS = 15
 
 # Eye threshold is learned automatically in the background (no calibration step):
 EAR_DEFAULT_THRESHOLD = 0.12  # "clearly closed" default until the driver's eyes are learned
-EAR_DEFAULT_SQUINT = 0.21    # squint zone upper bound default
+EAR_DEFAULT_NARROW = 0.17     # heavy-eyelid default until learned
+EAR_DEFAULT_SQUINT = 0.21   # squint zone upper bound default
 EAR_THRESHOLD_RATIO = 0.45    # EAR < baseline*0.45 -> clearly closed
-EAR_SQUINT_RATIO = 0.70       # baseline*0.45..0.70 (glasses: closed eyes still read ~0.55-0.6 x open) -> squint zone: closed only if no iris visible
+EAR_SQUINT_RATIO = 0.78       # baseline*0.45..0.78 (glasses: closed eyes still read ~0.6-0.75 x open)
+NARROW_RATIO = 0.65           # "heavy eyelids" warning: EAR below baseline*0.65 for NARROW_WARN_S -> squint zone: closed only if no iris visible
 IRIS_DARK_MIN = 0.25          # eye middle >= 25 % darker than its corners = iris visible
 SMILE_RATIO = 1.10            # mouth width >= 110 % of the driver's normal = smiling/laughing
 NARROW_WARN_S = 4.0          # eyes narrow (squint zone or closed) this long -> WARNING
@@ -262,6 +264,7 @@ class DrowsinessDetector:
         self.last_learn = 0.0
         self.ear_threshold = EAR_DEFAULT_THRESHOLD
         self.squint_threshold = EAR_DEFAULT_SQUINT
+        self.narrow_threshold = EAR_DEFAULT_NARROW
         self.calibrated = False             # True once the driver's eyes are learned
         self.ear_buf = deque(maxlen=3)
         self.closed_since = None            # effective closure (after AI veto/confirm)
@@ -286,6 +289,7 @@ class DrowsinessDetector:
         self.baseline = None
         self.ear_threshold = EAR_DEFAULT_THRESHOLD
         self.squint_threshold = EAR_DEFAULT_SQUINT
+        self.narrow_threshold = EAR_DEFAULT_NARROW
         self.calibrated = False
 
     def _relative_yaw(self, t, yaw):
@@ -339,6 +343,8 @@ class DrowsinessDetector:
             self.baseline = max(new, self.baseline - max_drop)
         self.ear_threshold = float(np.clip(self.baseline * EAR_THRESHOLD_RATIO, 0.07, 0.22))
         self.squint_threshold = float(np.clip(self.baseline * EAR_SQUINT_RATIO,
+                                              self.ear_threshold + 0.02, 0.30))
+        self.narrow_threshold = float(np.clip(self.baseline * NARROW_RATIO,
                                               self.ear_threshold + 0.02, 0.30))
         if not self.calibrated:
             self.calibrated = True
@@ -469,7 +475,7 @@ class DrowsinessDetector:
                 s["eyes_closed"] = closed
                 self.recent_closed.append((t, closed))
                 # heavy eyelids: narrow (squint zone) or closed for a long stretch
-                if ear < self.squint_threshold:
+                if ear < self.narrow_threshold:
                     if self.narrow_since is None:
                         self.narrow_since = t
                 else:
