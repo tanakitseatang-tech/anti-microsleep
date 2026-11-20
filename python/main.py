@@ -97,7 +97,10 @@ DROP_PITCH_RISE = 8.0        # head pitched down by this much in the last 2 s be
 DROP_FACE_SLIDE = 0.06        # or the face slid down by 6 % of the frame height
 PITCH_DOWN_SIGN = 1.0        # +1 if pitch grows when the head goes down (checked on device)
 YAW_MAX = 0.35                # |yaw| above this = head turned, eyes not judged
-YAW_LEARN_MAX = 0.15          # learning only uses frames facing the camera
+YAW_LEARN_MAX = 0.15          # learning only uses frames facing the driver's normal direction
+YAW_BASE_MAX = 0.55           # camera may sit off to the side: the driver's normal yaw is learned
+                              # (median of the last 2 min) and yaw is judged relative to it, up to this
+YAW_BASE_MIN_FRAMES = 100     # face frames needed before the learned normal yaw is used
 LOOK_AWAY_WARN_S = 4.0        # head turned away this long -> WARNING (distraction)
 LOOK_AWAY_ALARM_S = 10.0      # ... this long -> ALARM (eyes off the road far too long, or asleep turned)
 NO_FACE_WARN_S = 4.0         # good light but no face this long -> WARNING
@@ -251,6 +254,8 @@ class DrowsinessDetector:
         self.last_head_down = False
         self.dropped = False                # face vanished downward = head dropped
         self.base_pitch = self.base_roll = None
+        self.yaw_samples = deque()          # (t, raw yaw) all face frames, last 2 min
+        self.base_yaw = 0.0                 # driver's normal yaw (camera off-centre)
         self.head_since = None
         self.baseline = None
         self.last_learn = 0.0
@@ -275,10 +280,23 @@ class DrowsinessDetector:
         self.mouth_samples.clear()
         self.base_mouth = None
         self.base_pitch = self.base_roll = None
+        self.yaw_samples.clear()
+        self.base_yaw = 0.0
         self.baseline = None
         self.ear_threshold = EAR_DEFAULT_THRESHOLD
         self.squint_threshold = EAR_DEFAULT_SQUINT
         self.calibrated = False
+
+    def _relative_yaw(self, t, yaw):
+        """Yaw relative to the driver's learned normal direction (camera may be off to the side)."""
+        self.yaw_samples.append((t, yaw))
+        while self.yaw_samples and t - self.yaw_samples[0][0] > LEARN_WINDOW_S:
+            self.yaw_samples.popleft()
+        if len(self.yaw_samples) >= YAW_BASE_MIN_FRAMES and t - self.last_learn >= LEARN_EVERY_S:
+            # the driver looks at the road most of the time: the median is "facing forward"
+            self.base_yaw = float(np.clip(np.median([y for _, y in self.yaw_samples]),
+                                          -YAW_BASE_MAX, YAW_BASE_MAX))
+        return yaw - self.base_yaw
 
     def recalibrate(self):
         """Reset button: forget learned eyes and clear PERCLOS / yawns."""
@@ -355,8 +373,9 @@ class DrowsinessDetector:
             # head turn left/right: 0 = facing camera, +-1 = full profile.
             # A turned head makes the eyes look narrow (low EAR) -> ignore eyes then.
             dl, dr = _d(pts[NOSE_TIP], pts[FACE_LEFT]), _d(pts[NOSE_TIP], pts[FACE_RIGHT])
-            yaw = (dl - dr) / max(dl + dr, 1e-6)
-            s["yaw"] = yaw
+            raw_yaw = (dl - dr) / max(dl + dr, 1e-6)
+            yaw = self._relative_yaw(t, raw_yaw)     # 0 = the driver's normal direction
+            s["yaw"], s["raw_yaw"] = yaw, raw_yaw
             frontal = abs(yaw) < YAW_MAX
             s["looking_away"] = not frontal
             if frontal:
