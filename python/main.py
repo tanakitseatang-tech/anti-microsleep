@@ -49,14 +49,14 @@ FPS = 15
 
 # Eye threshold is learned automatically in the background (no calibration step):
 EAR_DEFAULT_THRESHOLD = 0.12  # "clearly closed" default until the driver's eyes are learned
-EAR_DEFAULT_SQUINT = 0.17     # squint zone upper bound default
+EAR_DEFAULT_SQUINT = 0.21    # squint zone upper bound default
 EAR_THRESHOLD_RATIO = 0.45    # EAR < baseline*0.45 -> clearly closed
-EAR_SQUINT_RATIO = 0.65       # baseline*0.45..0.65 -> squint zone: closed only if no iris visible
+EAR_SQUINT_RATIO = 0.70       # baseline*0.45..0.70 (glasses: closed eyes still read ~0.55-0.6 x open) -> squint zone: closed only if no iris visible
 IRIS_DARK_MIN = 0.25          # eye middle >= 25 % darker than its corners = iris visible
 SMILE_RATIO = 1.10            # mouth width >= 110 % of the driver's normal = smiling/laughing
 NARROW_WARN_S = 4.0          # eyes narrow (squint zone or closed) this long -> WARNING
 LEARN_WINDOW_S = 120.0        # baseline = 75th percentile of the last 2 min of frontal EAR
-LEARN_MIN_S = 20.0            # need this much face time before the first update
+LEARN_MIN_S = 10.0           # need this much face time before the first update
 LEARN_EVERY_S = 2.0
 BASELINE_DROP_PER_MIN = 0.03  # baseline may fall only slowly (drowsy eyes must not lower it)
 NEW_DRIVER_NO_FACE_S = 30.0   # no face this long -> forget baseline (driver may change)
@@ -129,7 +129,8 @@ SQUINT_TEST_LOG = True         # TEMP: log EAR + iris value in the squint zone (
 ROBOFLOW_MIN_CONF = 0.45
 ROBOFLOW_VERDICT_TTL_S = 2.5   # trust a verdict for this long after its frame was taken
 ROBOFLOW_TIMEOUT_S = 3.0
-EAR_BORDERLINE = 1.20          # EAR < threshold*1.2 + model says closed -> closed
+AI_VETO_MAX_S = 1.5            # AI "open" may cancel an EAR closure only during its first 1.5 s
+EAR_BORDERLINE = 1.20         # EAR < threshold*1.2 + model says closed -> closed
 ALARM_SOUND = os.path.join(APP_DIR, "sounds", "beep.wav")  # looped only while level = ALARM
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
 LIVE_JPEG_QUALITY = 70       # live view at http://<board-ip>:7000
@@ -452,9 +453,12 @@ class DrowsinessDetector:
                     s["ai"], s["ai_conf"] = state, conf
                     # veto only borderline closures: a clearly shut eye (very low EAR)
                     # always counts, so a wrong cloud answer can't hide a real microsleep
+                    # Glasses fool the cloud model (it keeps saying "open"), so the veto
+                    # only covers short closures: past AI_VETO_MAX_S the eyes win.
                     if (ear_closed and state == "open" and conf >= 0.70
                             and ear > self.ear_threshold * 0.6
-                            and frame_t >= self.ear_closed_since - 0.3):
+                            and frame_t >= self.ear_closed_since - 0.3
+                            and t - self.ear_closed_since < AI_VETO_MAX_S):
                         closed = False                      # AI saw open eyes during this "closure"
                         s["ai_note"] = "veto"
                     # (no "AI confirms closed" rule: tests showed the cloud model
@@ -473,7 +477,9 @@ class DrowsinessDetector:
 
                 if closed:
                     if self.closed_since is None:
-                        self.closed_since = t
+                        # a closure the AI vetoed at first counts from when the eyes shut
+                        self.closed_since = (self.ear_closed_since
+                                             if ear_closed and self.ear_closed_since is not None else t)
                     s["closed_for"] = t - self.closed_since
                 else:
                     self.closed_since = None
@@ -1688,6 +1694,8 @@ def loop():
                     f" | pitch={s['pitch'] if s['pitch'] is None else round(s['pitch'], 1)}"
                     f" base={bp if bp is None else round(bp, 1)} roll={s['roll']:.0f}"
                     f" down={s['head_down']} tilt={s['head_tilt']}"
+                    f" yaw={s['yaw'] if s['yaw'] is None else round(s['yaw'], 2)}"
+                    f" ai={s.get('ai')}/{s.get('ai_note')}"
                     f" | mouth={s['mouth'] if s['mouth'] is None else round(s['mouth'], 2)}"
                     f" base={detector.base_mouth if detector.base_mouth is None else round(detector.base_mouth, 2)}"
                     f" smile={s['smiling']}")
