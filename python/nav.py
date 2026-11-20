@@ -25,10 +25,10 @@ CANDIDATES = 8                 # straight-line candidates sent to the router
 AHEAD_DEG = 70                 # stop within +-70 deg of the heading = "ahead"
 AHEAD_MIN_KMH = 15             # heading only trusted above this speed
 BEHIND_PENALTY = 2.5           # behind-the-truck stops count as this much farther
-RECOMPUTE_S = 10.0
-RECOMPUTE_M = 250.0
+RECOMPUTE_S = 5.0
+RECOMPUTE_M = 50.0
 GPS_STALE_S = 6.0
-GPS_FIX_HOLD_S = 20.0          # keep last valid fix through brief roof/building signal dips
+GPS_FIX_HOLD_S = 3600.0        # keep last valid real GPS fix when walking indoors / into blind spots
 OSRM_PORT = 5000
 OSRM_TIMEOUT_S = 2.0
 HEADING_TOL_DEG = 45           # route must leave the truck within +-45 deg of its heading
@@ -130,22 +130,50 @@ class Navigator:
         self.maps_dir = maps_dir
         self.index = PoiIndex(os.path.join(maps_dir, "pois.json"))
         self.test_file = os.path.join(maps_dir, "test_location.json")
+        self.last_gps_file = os.path.join(maps_dir, "last_gps.json")
         self.test_loc = self._load_test()
         self.lock = threading.Lock()
         self.calc_lock = threading.Lock()
         self.gps = {"state": -1, "t": 0.0}
-        self._sats_hist = deque(maxlen=10)      # (t, sats) for stable satellite count
-        self._pos_hist = deque(maxlen=6)        # (t, lat, lon, raw_speed) for speed & coord smoothing
+        self._sats_hist = deque(maxlen=12)      # (t, sats) for stable satellite count
+        self._pos_hist = deque(maxlen=8)        # (t, lat, lon, raw_speed) for speed & coord smoothing
         self._smooth_lat = None
         self._smooth_lon = None
         self._smooth_speed = 0.0
-        self._last_fix = None                   # last valid GPS fix dictionary
+        self._last_fix = self._load_last_gps()  # persisted real GPS fix for indoor / blind-spot entry
+        self._last_gps_save_t = 0.0
         self.osrm = f"http://{_docker_host_ip()}:{OSRM_PORT}"
         self.osrm_ok = None
         self.result, self._last_at, self._last_t = {}, None, 0.0
         logger.info(f"Rest stops loaded: {len(self.index.pois)} (OSM {self.index.updated}); router {self.osrm}")
 
     # ------------------------------------------------------------ location
+    def _load_last_gps(self):
+        try:
+            with open(self.last_gps_file) as f:
+                d = json.load(f)
+            return {
+                "state": 1, "t": time.time(), "sats": int(d.get("sats", 6)), "hdop": 1.5,
+                "lat": float(d["lat"]), "lon": float(d["lon"]),
+                "speed": 0.0, "course": d.get("course"), "indoor_hold": True,
+            }
+        except Exception:
+            return None
+
+    def _save_last_gps(self, g):
+        now = time.time()
+        if now - self._last_gps_save_t < 5.0:
+            return
+        self._last_gps_save_t = now
+        try:
+            with open(self.last_gps_file, "w") as f:
+                json.dump({
+                    "lat": g["lat"], "lon": g["lon"],
+                    "sats": g.get("sats", 6), "course": g.get("course"), "t": now,
+                }, f)
+        except Exception:
+            pass
+
     def _load_test(self):
         try:
             with open(self.test_file) as f:
@@ -229,31 +257,67 @@ class Navigator:
                     lon=round(self._smooth_lon, 6),
                     speed=round(self._smooth_speed, 1),
                     course=course_x10 / 10.0 if course_x10 >= 0 else None,
+                    indoor_hold=False,
                 )
                 self._last_fix = dict(g)
-            elif raw_state >= 0 and self._last_fix and (now - self._last_fix["t"] < GPS_FIX_HOLD_S):
-                # Hold the last good GPS fix during brief indoor/roof dips so the map & sats don't flicker
+                self._save_last_gps(g)
+            elif self._last_fix and (now - self._last_fix["t"] < GPS_FIX_HOLD_S):
+                # Hold the last known real GPS / indoor Wi-Fi fix when inside a building or blind spot
+                decay = 0.7 if (now - self._last_fix["t"] < 8.0) else 0.0
+                self._smooth_speed = round(self._smooth_speed * decay, 1) if self._smooth_speed >= 0.8 else 0.0
                 g = {
                     **self._last_fix,
+                    "state": 1,
                     "t": now,
-                    "sats": max(stable_sats, self._last_fix.get("sats", 4)),
-                    "speed": round(self._smooth_speed * 0.8, 1) if self._smooth_speed >= 1.0 else 0.0,
+                    "sats": max(stable_sats, self._last_fix.get("sats", 5)),
+                    "speed": self._smooth_speed,
+                    "indoor_hold": (now - self._last_fix["t"]) >= 8.0,
                 }
 
             if self.gps.get("state") != g["state"]:
                 self.log.info(f"GPS state {self.gps.get('state')} -> {g['state']} (sats {g['sats']})")
             self.gps = g
 
+    def set_indoor_location(self, lat, lon, speed=None, course=None):
+        """Indoor Wi-Fi / A-GPS assist from the driver's browser when satellite signals are blocked inside buildings."""
+        lat, lon = float(lat), float(lon)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("bad coordinates")
+        now = time.time()
+        with self.lock:
+            # Only override if hardware satellite GPS is not actively locked right this second
+            if self._last_fix and not self._last_fix.get("indoor_hold") and (now - self._last_fix.get("t", 0) < 4.0):
+                return
+            spd = 0.0 if speed is None else max(0.0, round(float(speed) * 3.6, 1))
+            if spd < 1.2:
+                spd = 0.0
+            g = {
+                "state": 1, "t": now, "sats": max(self.gps.get("sats", 0), 5), "hdop": 1.5,
+                "lat": round(lat, 6), "lon": round(lon, 6),
+                "speed": spd, "course": None if course is None else round(float(course) % 360, 1),
+                "indoor_hold": True,
+            }
+            self._smooth_lat, self._smooth_lon, self._smooth_speed = lat, lon, spd
+            self._last_fix = dict(g)
+            self.gps = g
+            self._save_last_gps(g)
+
     def location(self):
         with self.lock:
-            g, test = dict(self.gps), self.test_loc
-        age = time.time() - g["t"] if g.get("t") else None   # None = MCU never sent GPS data
+            g, last_fix, test = dict(self.gps), self._last_fix, self.test_loc
+        age = time.time() - g["t"] if g.get("t") else None
         fresh = age is not None and age < GPS_STALE_S
-        gps_state = g.get("state", -1) if fresh else -1
-        base = {"gps": gps_state, "sats": g.get("sats", 0), "mcu_age": None if age is None else round(age, 1)}
-        if gps_state == 1:
-            return {**base, "lat": g["lat"], "lon": g["lon"], "speed": g.get("speed"),
-                    "course": g.get("course"), "source": "gps"}
+        gps_state = g.get("state", -1) if fresh else (1 if last_fix else -1)
+        base = {
+            "gps": gps_state,
+            "sats": g.get("sats", 0) if fresh else (last_fix.get("sats", 5) if last_fix else 0),
+            "mcu_age": None if age is None else round(age, 1),
+            "indoor": bool(g.get("indoor_hold") if fresh else True),
+        }
+        if gps_state == 1 and (fresh or last_fix):
+            src = g if (fresh and g.get("lat") is not None) else last_fix
+            return {**base, "lat": src["lat"], "lon": src["lon"], "speed": src.get("speed", 0.0),
+                    "course": src.get("course"), "source": "gps"}
         if test:
             return {**base, "lat": test[0], "lon": test[1], "speed": None, "course": test[2], "source": "test"}
         return {**base, "lat": None, "lon": None, "source": "none"}

@@ -380,7 +380,8 @@ async function pollNav(once) {
     setBase(!!nav.offline_map);
     const loc = nav.loc;
     const spdStr = loc.speed == null ? "" : ` · ${loc.speed > 0 && loc.speed < 10 ? loc.speed.toFixed(1) : Math.round(loc.speed)} กม./ชม.`;
-    const gpsTxt = loc.source === "gps" ? `GPS ✓ ${loc.sats || 0} ดวง${spdStr}`
+    const indoorTag = loc.indoor ? " (ในอาคาร)" : "";
+    const gpsTxt = loc.source === "gps" ? `GPS ✓ ${loc.sats || 0} ดวง${indoorTag}${spdStr}`
       : loc.gps === 0 ? `GPS กำลังหาดาวเทียม (${loc.sats || 0})` : "ไม่มี GPS";
     $("gpsPill").textContent = gpsTxt;
     $("testnote").hidden = loc.source !== "test";
@@ -395,7 +396,20 @@ async function pollNav(once) {
     }
     renderStop();
   } catch (e) {}
-  if (!once) setTimeout(pollNav, 2000);
+  if (!once) setTimeout(pollNav, 800);
+}
+
+// Indoor / blind-spot Wi-Fi & A-GPS assist from the device browser when satellite GPS is shaded indoors
+if (navigator.geolocation) {
+  let lastIndoorPush = 0;
+  navigator.geolocation.watchPosition((pos) => {
+    const now = Date.now();
+    if (now - lastIndoorPush < 2500) return;
+    if (nav && nav.loc && nav.loc.source === "gps" && !nav.loc.indoor) return;
+    lastIndoorPush = now;
+    const c = pos.coords;
+    post("/api/indoor_location", { lat: c.latitude, lon: c.longitude, speed: c.speed, course: c.heading });
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 });
 }
 
 // ------------------------------------------------------------------ drowsiness status, shift, alerts

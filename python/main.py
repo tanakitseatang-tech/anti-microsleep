@@ -1421,20 +1421,32 @@ def _map_file():
     return FileResponse(MAP_FILE, media_type="application/octet-stream")
 
 
+def _nav_indoor_location(body: dict = Body(...)):
+    try:
+        navigator.set_indoor_location(
+            body.get("lat"), body.get("lon"), body.get("speed"), body.get("course")
+        )
+    except (TypeError, ValueError) as e:
+        return {"ok": False, "error": str(e)}
+    company_sync.wake()
+    return {"ok": True}
+
+
 ui.expose_api("GET", "/api/nav", _nav_state)
 ui.expose_api("GET", "/api/pois", _nav_pois)
 ui.expose_api("POST", "/api/test_location", _nav_test_location)
+ui.expose_api("POST", "/api/indoor_location", _nav_indoor_location)
 ui.expose_api("GET", "/maps/thailand.pmtiles", _map_file)
 
 
 # --------------------------------------------------------------------------
-# Company server sync (S1 events, S2 offline SQLite queue, S3 ~1 min heartbeat)
+# Company server sync (S1 events, S2 offline SQLite queue, S3 real-time heartbeat)
 # --------------------------------------------------------------------------
 COMPANY_URL_DEFAULT = "https://antimicrosleep-head.vercel.app"
 COMPANY_URL_FILE = os.path.join(APP_DIR, "company_url.txt")
 COMPANY_KEY_FILE = os.path.join(APP_DIR, "company_api_key.txt")
 COMPANY_QUEUE_DB = os.path.join(DATA_DIR, "company_queue.sqlite")
-COMPANY_HEARTBEAT_S = 30.0
+COMPANY_HEARTBEAT_S = 5.0
 APP_VERSION = "2026-11-20"
 
 
