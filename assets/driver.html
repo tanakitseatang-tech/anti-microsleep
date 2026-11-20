@@ -133,6 +133,7 @@
 <div class="top">
   <div class="pill"><span class="dot" id="dot"></span><span id="title">ANTI MICROSLEEP</span></div>
   <div class="spacer"></div>
+  <div class="pill small" id="syncPill" title="สถานะส่งข้อมูลขึ้นเว็บบริษัท">☁️ ซิงก์บริษัท</div>
   <button class="pill small" id="mapModeBtn" style="cursor:pointer">🗺️ แผนที่ละเอียด</button>
   <div class="pill small" id="gpsPill">GPS…</div>
 </div>
@@ -149,7 +150,14 @@
     <div class="ack-title" id="ackTitle">⚠️ มีการแจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว (เพื่อปิดเคสที่บริษัท)</div>
     <div class="ack-btns">
       <button class="ack-btn" id="ackAwakeBtn">✅ ฉันตื่นแล้ว</button>
-      <button class="ack-btn rest" id="ackBreakBtn">☕ แวะพักรถแล้ว</button>
+      <button class="ack-btn rest" id="ackBreakBtn">☕ แวะพักรถแล้ว (15 นาที)</button>
+    </div>
+  </div>
+  <div class="ack-box" id="restTimerBox">
+    <div class="ack-title" id="restTimerTitle">☕ กำลังจอดพักฟื้นร่างกาย (แนะนำพัก 15 นาทีหลังแจ้งเตือน)</div>
+    <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
+      <div class="shift-time" id="restCountdown" style="font-size:26px; color:var(--ok)">15:00</div>
+      <button class="btn primary" id="resumeDriveBtn" style="width:auto; padding:0 16px; min-height:42px">▶️ พักเสร็จแล้ว · ขับต่อ</button>
     </div>
   </div>
   <div class="rest-msg" id="restMsg"></div>
@@ -170,10 +178,11 @@
 
   <details id="more">
     <summary>เวลาขับ · การเตือนวันนี้</summary>
-    <div class="section-h">เวลาขับ (ตั้งแต่พักครั้งล่าสุด)</div>
+    <div class="section-h">เวลาขับ · ลงชื่อคนขับประจำกะ</div>
     <div id="shiftOff">
-      <div class="sub" style="margin-bottom:8px">ยังไม่ได้เริ่มกะ</div>
-      <button class="btn primary" id="startBtn">▶️ เริ่มกะ</button>
+      <div class="sub" style="margin-bottom:8px">ระบุชื่อหรือรหัสพนักงานก่อนเริ่มกะ</div>
+      <input id="driverNameInput" placeholder="รหัส/ชื่อคนขับ เช่น EMP001 สมชาย" style="width:100%; padding:10px; border-radius:10px; border:1px solid var(--line); background:#0f1318; color:var(--text); font:inherit; margin-bottom:8px">
+      <button class="btn primary" id="startBtn">▶️ เริ่มกะขับรถ</button>
     </div>
     <div id="shiftOn" hidden>
       <div class="shift-time" id="drive">0:00</div>
@@ -196,7 +205,11 @@
       <button class="btn" id="testWarnBtn">🟡 ทดสอบเตือน</button>
       <button class="btn" id="testAlarmBtn">🔴 ทดสอบหลับใน</button>
     </div>
-    <div class="foot"><a href="/">หน้าจอสำหรับช่าง (ภาพกล้อง)</a></div>
+    <div class="foot">
+      <a href="/">📷 หน้าจอสำหรับช่าง (ภาพสด)</a> ·
+      <a href="/both.html">🖥️ จอคู่</a> ·
+      <a href="https://antimicrosleep-head.vercel.app" target="_blank" rel="noopener">🏢 เว็บบริษัท</a>
+    </div>
   </details>
 </section>
 
@@ -439,9 +452,36 @@ const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s /
 const fmtClock = (t) => new Date(t * 1000).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" });
 
 let state = null, lastOk = 0;
+let driverProfile = localStorage.getItem("ams_driver_name") || "";
+let restUntil = Number(localStorage.getItem("ams_rest_until") || 0);
+if ($("driverNameInput")) $("driverNameInput").value = driverProfile;
+
+function startRestTimer(minutes = 15) {
+  restUntil = Date.now() + minutes * 60 * 1000;
+  localStorage.setItem("ams_rest_until", String(restUntil));
+  render();
+}
+function stopRestTimer() {
+  restUntil = 0;
+  localStorage.removeItem("ams_rest_until");
+  render();
+}
+
 function render() {
   const d = state; if (!d) return;
-  $("title").textContent = `รถคันที่ ${d.truck}`;
+  const drvTag = driverProfile ? ` · ${driverProfile}` : "";
+  $("title").textContent = `รถคันที่ ${d.truck}${drvTag}`;
+  const online = navigator.onLine;
+  $("syncPill").textContent = online ? "☁️ ซิงก์บริษัทแล้ว" : "⏳ ออฟไลน์ (เก็บในคิวบอร์ด)";
+  $("syncPill").style.color = online ? "var(--ok)" : "var(--warn)";
+
+  const restRemS = Math.max(0, Math.ceil((restUntil - Date.now()) / 1000));
+  $("restTimerBox").className = "ack-box" + (restRemS > 0 ? " show" : "");
+  if (restRemS > 0) {
+    const mm = String(Math.floor(restRemS / 60)).padStart(2, "0");
+    const ss = String(restRemS % 60).padStart(2, "0");
+    $("restCountdown").textContent = `${mm}:${ss}`;
+  }
   let icon, big, why;
   if (d.level > 0) { [icon, big] = LEVEL_TEXT[d.level]; why = thAll(d.reasons); }
   else if (STATUS_TEXT[d.status]) { [icon, big, why] = STATUS_TEXT[d.status]; }
@@ -509,11 +549,19 @@ async function pollDriver() {
 async function post(url, body) {
   try { await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch (e) {}
 }
-$("startBtn").onclick = () => post("/api/shift", { action: "start" });
-$("breakBtn").onclick = () => post("/api/shift", { action: "break" });
-$("endBtn").onclick = () => { if (confirm("จบกะตอนนี้?")) post("/api/shift", { action: "end" }); };
+$("startBtn").onclick = () => {
+  const name = ($("driverNameInput")?.value || "").trim();
+  if (name) {
+    driverProfile = name;
+    localStorage.setItem("ams_driver_name", name);
+  }
+  post("/api/shift", { action: "start", driver: driverProfile });
+};
+$("breakBtn").onclick = () => { startRestTimer(15); post("/api/shift", { action: "break" }); };
+$("endBtn").onclick = () => { if (confirm("จบกะตอนนี้?")) { stopRestTimer(); post("/api/shift", { action: "end" }); } };
 $("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollDriver(); };
-$("ackBreakBtn").onclick = async () => { await post("/api/driver/ack", { kind: "break" }); pollDriver(); };
+$("ackBreakBtn").onclick = async () => { startRestTimer(15); await post("/api/driver/ack", { kind: "break" }); pollDriver(); };
+$("resumeDriveBtn").onclick = () => stopRestTimer();
 $("testWarnBtn").onclick = async () => { await post("/api/driver/test_alert", { level: 1 }); pollDriver(); };
 $("testAlarmBtn").onclick = async () => { await post("/api/driver/test_alert", { level: 2 }); pollDriver(); };
 
