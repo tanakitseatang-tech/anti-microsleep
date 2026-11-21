@@ -108,6 +108,8 @@
                 font-size: 18px; font-weight: 700; line-height: 1.35; }
   .rest-alarm b { font-size: 24px; }
   .dock .btn.small { min-height: 48px; font-size: 16px; }
+  /* board unreachable: the docks show stale state and would cover the "เชื่อมต่อบอร์ดไม่ได้" banner */
+  body.board-offline .dock { display: none !important; }
 
   /* ---------------------------------------------------------------- panel: bottom sheet (phone) / side panel (PC) */
   .panel { position: fixed; z-index: 1050; background: var(--panel); display: flex; flex-direction: column; }
@@ -132,9 +134,35 @@
     .dock { right: 72px; }                 /* keep the map buttons on the right free */
     body.sheet-open #expandBtn .up { display: none; } body.sheet-open #expandBtn .down { display: inline; }
   }
-  /* phone turned sideways: the sheet may use only part of the short screen, the map stays visible */
+  /* phone turned sideways: the panel becomes a scrollable LEFT side sheet below the top bar, the map,
+     its buttons (◎ recenter, ⛶) and the test-location note stay free on the right */
   @media (max-width: 899px) and (orientation: landscape) and (max-height: 520px) {
-    .panel { max-height: 62vh; max-height: 62dvh; }
+    :root { --side-w: min(46vw, 380px); }
+    .panel { top: calc(var(--bar-h) + var(--safe-t)); right: auto; bottom: 0; width: var(--side-w);
+             max-height: none; border-radius: 0; border-top: 0; border-right: 1px solid var(--line);
+             box-shadow: 10px 0 30px rgba(0,0,0,.35); padding-left: env(safe-area-inset-left, 0px); }
+    .panel-body { flex: 1 1 auto; min-height: 0; }
+    .handle, #expandBtn { display: none; }
+    .panel-head { padding-top: 8px; }
+    #map, .maparea { left: var(--side-w); }
+    body.panel-hidden .panel { transform: translateX(-102%); }
+    body.panel-hidden #map, body.panel-hidden .maparea { left: 0; }
+    /* the side sheet has room for everything: no small "peek" state */
+    body:not(.sheet-open) .more { display: block; }
+    body.no-shift:not(.sheet-open) .more > .card:not(:first-child) { display: block; }
+    /* no shift yet: the 3-digit check-in card comes first, so its input + start button fit */
+    body.no-shift .panel-body { display: flex; flex-direction: column; }
+    body.no-shift .panel-body > * { flex: none; }
+    body.no-shift .panel-body > .more { order: -1; margin-top: 0 !important; }
+    body.no-shift .panel-body > .seg { margin-top: 4px; }
+    /* start button right under the code input (PDPA note moves below it) */
+    #shiftOff { display: flex; flex-direction: column; }
+    #shiftOff > :nth-child(4) { order: 1; margin: 8px 0 0 !important; }
+    /* test-location note: bottom-left of the map (above the attribution line), never under the status card */
+    .testnote { top: auto; bottom: 22px; }
+    body.panel-hidden .testnote { bottom: 76px; }      /* clear the "แสดงแผงข้อมูล" button */
+    .card { padding: 12px; }
+    input.text { min-height: 44px; }
     .dock { top: calc(var(--bar-h) + var(--safe-t) + 4px); padding: 10px 12px; }
     .dock .btn, .dock-btns.three .btn { min-height: 46px; font-size: 16px; }
   }
@@ -766,8 +794,15 @@ function render() {
   updateDriverPreview();
   // real company-sync state from the board (not the phone's own "online" flag)
   // an error after the last OK (e.g. events refused while heartbeats pass) = not synced
-  const errNewer = !!d.sync_err && (d.sync_err_at == null || d.sync_ok_at == null || d.sync_err_at >= d.sync_ok_at);
-  const synced = d.sync_ok_at != null && d.now - d.sync_ok_at < 30 && !errNewer;
+  // ages are measured on the board's monotonic clock (NTP jumps / phone clock skew can't fake them)
+  let synced;
+  if (d.sync_ok_age !== undefined) {
+    const okAge = d.sync_ok_age, errAge = d.sync_err_age;
+    synced = okAge != null && okAge < 30 && (!d.sync_err || errAge == null || errAge > okAge);
+  } else {                                     // older board app: wall-clock fields
+    const errNewer = !!d.sync_err && (d.sync_err_at == null || d.sync_ok_at == null || d.sync_err_at >= d.sync_ok_at);
+    synced = d.sync_ok_at != null && d.now - d.sync_ok_at < 30 && !errNewer;
+  }
   $("syncTxt").textContent = synced ? "ซิงก์บริษัทแล้ว" : "ยังส่งบริษัทไม่ได้ (เก็บในคิว)";
   $("syncPill").className = "chip " + (synced ? "good" : "warn");
   $("syncPill").title = $("syncTxt").textContent;
@@ -793,7 +828,9 @@ function render() {
     : "⚠️ แจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว";
   $("restTimerBox").hidden = !resting || restPickOpen;
   if (resting) {
-    const rem = Math.round(d.rest_until - d.now);          // board clock, not the phone's
+    // board-measured time left (monotonic, immune to clock jumps); older app: board wall clock
+    const left = d.rest_left != null ? d.rest_left : d.rest_until - d.now;
+    const rem = Math.round(left);
     const a = Math.abs(rem);
     const mmss = `${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
     $("restCountdown").textContent = rem >= 0 ? mmss : "+" + mmss;
@@ -805,7 +842,7 @@ function render() {
             ? "🔔 หมดเวลาพักแล้ว! กด \"ขับต่อ\" เพื่อหยุดเสียงปลุก (ไม่พบกล้อง)"
             : "🔔 หมดเวลาพักแล้ว! ลืมตามองกล้อง 3 วินาที หรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก")
         : "⏰ หมดเวลาพักแล้ว! (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
-    $("restAlarmTime").textContent = hhmm(d.rest_until);
+    $("restAlarmTime").textContent = hhmm(d.now + left);   // = rest_until unless the clock jumped
     $("restAlarmTxt").hidden = rem < 0;
   }
   $("status").style.visibility = needAck || resting || restPickOpen ? "hidden" : "";
@@ -861,6 +898,8 @@ async function pollDriver() {
   const alive = Date.now() - lastOk < 4000;
   $("dot").classList.toggle("on", alive);
   $("conn").textContent = alive ? "เชื่อมต่อบอร์ดแล้ว" : "เชื่อมต่อบอร์ดไม่ได้";
+  // offline: hide the alert/rest docks (old state) so the connection banner is not covered
+  document.body.classList.toggle("board-offline", !alive);
   if (!alive) {
     // board unreachable: stop showing old state (e.g. a red flash) as if it were live
     $("flash").className = "";
