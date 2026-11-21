@@ -118,7 +118,7 @@
   .more { display: block; }
 
   @media (max-width: 899px) {
-    .panel { left: 0; right: 0; bottom: 0; max-height: 78vh; border-radius: 22px 22px 0 0; border-top: 1px solid var(--line);
+    .panel { left: 0; right: 0; bottom: 0; max-height: 78vh; max-height: 78dvh; border-radius: 22px 22px 0 0; border-top: 1px solid var(--line);
              box-shadow: 0 -10px 30px rgba(0,0,0,.45); transition: transform .25s ease; }
     .handle { display: block; position: absolute; top: 6px; left: 50%; transform: translateX(-50%); width: 44px; height: 5px;
               border-radius: 3px; background: var(--line); }
@@ -126,7 +126,14 @@
     body:not(.sheet-open) .more { display: none; }
     body.panel-hidden .panel { transform: translateY(110%); }
     #expandBtn .up { display: inline; } #expandBtn .down { display: none; }
+    .dock { right: 72px; }                 /* keep the map buttons on the right free */
     body.sheet-open #expandBtn .up { display: none; } body.sheet-open #expandBtn .down { display: inline; }
+  }
+  /* phone turned sideways: the sheet may use only part of the short screen, the map stays visible */
+  @media (max-width: 899px) and (orientation: landscape) and (max-height: 520px) {
+    .panel { max-height: 62vh; max-height: 62dvh; }
+    .dock { top: calc(var(--bar-h) + var(--safe-t) + 4px); padding: 10px 12px; }
+    .dock .btn, .dock-btns.three .btn { min-height: 46px; font-size: 16px; }
   }
   @media (min-width: 900px) {
     .panel { top: calc(var(--bar-h) + var(--safe-t)); left: 0; bottom: 0; width: var(--panel-w); border-right: 1px solid var(--line);
@@ -190,7 +197,8 @@
   .scrim { position: fixed; inset: 0; z-index: 1300; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .2s; }
   .drawer { position: fixed; z-index: 1310; top: 0; bottom: 0; left: 0; width: min(330px, 86vw); background: var(--panel);
             border-right: 1px solid var(--line); transform: translateX(-102%); transition: transform .22s ease;
-            display: flex; flex-direction: column; padding: calc(var(--safe-t) + 8px) 12px calc(var(--safe-b) + 12px); }
+            display: flex; flex-direction: column; padding: calc(var(--safe-t) + 8px) 12px calc(var(--safe-b) + 12px);
+            overflow-y: auto; overscroll-behavior: contain; }   /* short / landscape phones: every menu button reachable */
   body.menu-open .scrim { opacity: 1; pointer-events: auto; }
   body.menu-open .drawer { transform: none; }
   .drawer-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
@@ -609,8 +617,9 @@ async function pollNav(once) {
     const loc = nav.loc;
     const spd = loc.speed == null ? "" : ` · ${loc.speed > 0 && loc.speed < 10 ? loc.speed.toFixed(1) : Math.round(loc.speed)} กม./ชม.`;
     const isSim = loc.source === "sim";
-    const ok = loc.source === "gps" || isSim;
+    const ok = (loc.source === "gps" && !loc.stale) || isSim;   // old saved fix = not live GPS
     $("gpsTxt").textContent = isSim ? `🚗 จำลองขับ${spd}`
+      : loc.source === "gps" && loc.stale ? "ตำแหน่งล่าสุด (GPS ขาด)"
       : loc.source === "gps" ? `GPS ${loc.sats || 0} ดวง${loc.indoor ? " (ในอาคาร)" : ""}${spd}`
       : loc.gps === 0 ? `หาดาวเทียม (${loc.sats || 0})` : "ไม่มี GPS";
     $("gpsPill").className = "chip " + (isSim ? "warn" : ok ? "good" : "warn");
@@ -642,7 +651,7 @@ if (navigator.geolocation) {
     if (nav && nav.loc && nav.loc.source === "gps" && !nav.loc.indoor) return;
     lastIndoorPush = now;
     const c = pos.coords;
-    post("/api/indoor_location", { lat: c.latitude, lon: c.longitude, speed: c.speed, course: c.heading });
+    post("/api/indoor_location", { lat: c.latitude, lon: c.longitude, speed: c.speed, course: c.heading }, true);   // automatic: no pop-ups
   }, () => {}, { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 });
 }
 
@@ -836,8 +845,23 @@ async function keepAwake() {
 }
 document.addEventListener("pointerdown", keepAwake);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) keepAwake(); });
-async function post(url, body) {
-  try { await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch (e) {}
+// send a button press to the board; one at a time per address (no double sends), tell the driver if it failed
+const postBusy = new Set();
+async function post(url, body, quiet = false) {
+  if (postBusy.has(url)) return false;
+  postBusy.add(url);
+  try {
+    const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
+    clearTimeout(tm);
+    if (!r.ok) throw new Error(String(r.status));
+    return true;
+  } catch (e) {
+    if (!quiet) alert("ส่งคำสั่งไปบอร์ดไม่สำเร็จ ลองกดอีกครั้ง (เช็กว่ามือถือยังต่อ Wi-Fi/ฮอตสปอตของบอร์ด)");
+    return false;
+  } finally {
+    postBusy.delete(url);
+  }
 }
 $("startBtn").onclick = async () => {
   const raw = normCode($("driverNameInput").value);

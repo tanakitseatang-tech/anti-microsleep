@@ -59,7 +59,7 @@
   .back .arr { font-size: 20px; line-height: 1; }
   #login .back { align-self: center; margin-top: 6px; }
   body.embedded .back, body.embedded header nav { display: none; }
-  body.embedded #logout { display: none; }          /* no accidental logout on the presenter screen */
+  body.embedded #logout, body.embedded #pwCard, body.embedded #rfCard { display: none !important; }   /* presenter screen: no logout / password / key boxes */
   .video.off { border-color: #6b7280 !important; }   /* no camera / resting: grey, not green */
 </style>
 </head>
@@ -136,7 +136,7 @@
       </div>
       <div class="sub" id="rfMsg" style="margin-top:6px">key จะถูกเก็บบนบอร์ดเท่านั้น และจะไม่แสดงกลับมา</div>
     </div>
-    <div class="card">
+    <div class="card" id="pwCard">
       <h2>เปลี่ยนรหัสผ่านหน้านี้</h2>
       <form id="pwForm" style="display:flex; flex-direction:column; gap:8px">
         <input class="txt" id="pwOld" type="password" autocomplete="current-password" placeholder="รหัสเดิม" required>
