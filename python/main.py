@@ -161,6 +161,7 @@ NO_DRIVER_REPORT_S = 60.0
 # (Board off = engine off: no ring; the company website sends LINE if the rest runs 15 min over.)
 REST_CHOICES_MIN = (15, 30, 60)
 REST_ALARM_MAX_S = 10 * 60
+REST_AWAKE_S = 3.0             # face seen with eyes open this long after the rest = driver is back
 REST_CANCEL_KMH = 15.0          # a live GPS fix this fast during a rest = driving -> rest cancelled
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
 SPEAKER_VOLUME = "60%"          # USB speaker hardware volume (alarm + voice prompts)
@@ -2058,6 +2059,11 @@ def loop():
     global camera, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
     global no_driver_since, no_driver_voiced, no_driver_reported, was_resting
 
+    ringing = driver_log.rest_ringing()
+    if ringing != getattr(loop, "_rest_ring", False):
+        loop._rest_ring = ringing
+        logger.info("Rest alarm: speaker ringing (rest time is up)" if ringing else "Rest alarm: stopped")
+
     if camera is None:
         mcu.send(0, ST_NO_CAMERA)
         if alarm_sound is not None:
@@ -2123,12 +2129,20 @@ def loop():
 
     s = detector.update(pts, frame, t)
 
-    # Rest time is up and the driver's face is back -> rest over, normal driving.
-    if rest == "over" and pts is not None:
-        driver_log.end_rest()
-        company_sync.wake()
-        rest = None
-        logger.info("Driver back after rest (face seen): rest ended")
+    # Rest time is up: the alarm stops only when the driver is in front of the camera with eyes
+    # OPEN for REST_AWAKE_S (a driver asleep in the seat also shows a face) or presses "ขับต่อ".
+    if rest == "over":
+        if pts is not None and not s["eyes_closed"]:
+            if getattr(loop, "_awake_since", None) is None:
+                loop._awake_since = t
+            if t - loop._awake_since >= REST_AWAKE_S:
+                driver_log.end_rest()
+                company_sync.wake()
+                rest = None
+                loop._awake_since = None
+                logger.info(f"Driver back after rest (eyes open {REST_AWAKE_S:.0f}s): rest ended")
+        else:
+            loop._awake_since = None
     # Driver not visible during a shift (not resting): voice at 30 s, company + LINE at 60 s.
     # While a rest is overdue the company website handles it (LINE 15 min after rest end).
     if pts is None and rest is None and driver_log.shift_start:
