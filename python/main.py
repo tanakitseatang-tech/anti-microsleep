@@ -1257,6 +1257,8 @@ class LiveView:
         self.stats = {"status": "NO_CAMERA", "level": "OK", "level_num": 0}
 
     def publish_stats(self, s, fps):
+        # read the baseline once: "รีเซ็ต" from the web thread may set it to None at any moment
+        base_pitch, base_roll = detector.base_pitch, detector.base_roll
         self.stats = {
             "level": LEVEL_NAMES[s["level"]], "level_num": s["level"],
             "status": STATUS_NAMES[s["status"]], "face": s["face"],
@@ -1269,9 +1271,9 @@ class LiveView:
             "yaw": s.get("yaw"), "looking_away": s.get("looking_away", False),
             "squint": s.get("squint", False), "eyes_closed": s.get("eyes_closed", False),
             "smiling": s.get("smiling", False),
-            "pitch_delta": (s["pitch"] - detector.base_pitch) * PITCH_DOWN_SIGN
-                           if s.get("pitch") is not None and detector.base_pitch is not None else None,
-            "roll_delta": s["roll"] - (detector.base_roll or 0.0) if s.get("roll") is not None else None,
+            "pitch_delta": (s["pitch"] - base_pitch) * PITCH_DOWN_SIGN
+                           if s.get("pitch") is not None and base_pitch is not None else None,
+            "roll_delta": s["roll"] - (base_roll or 0.0) if s.get("roll") is not None else None,
             "head_down": s.get("head_down", False), "head_tilt": s.get("head_tilt", False),
             "head_back": s.get("head_back", False),
             "iris": s.get("iris"), "squint_threshold": detector.squint_threshold,
@@ -1954,6 +1956,7 @@ class CompanySync:
         self.db_lock = threading.Lock()
         self.pending_ack_note = None
         self.last_ok = None
+        self.clock_offset = 0.0      # company server time - board time (s), 0 when within a minute
         self.last_err = None
         os.makedirs(DATA_DIR, exist_ok=True)
         with self._db() as con:
@@ -2047,6 +2050,15 @@ class CompanySync:
         try:
             resp = self._post(f"{base}/api/ingest/heartbeat", key, hb)
             if isinstance(resp, dict):
+                # Board clock wrong (no internet time yet after a power cut)? The server refuses
+                # event times >10 min off, so remember the difference and correct the times we send.
+                srv = resp.get("server_time")
+                if isinstance(srv, (int, float)) and not isinstance(srv, bool):
+                    off = srv - time.time()
+                    new_off = off if abs(off) > 60 else 0.0
+                    if abs(new_off - self.clock_offset) > 60:
+                        logger.warning(f"Board clock is {off:+.0f}s off the company server: correcting event times")
+                    self.clock_offset = new_off
                 driver_log.update_drivers_cache(resp.get("drivers"), resp.get("driver"))
                 new_key = resp.get("provision_key")
                 if isinstance(new_key, str) and new_key.startswith("ams_") and len(new_key) >= 20:
@@ -2080,7 +2092,7 @@ class CompanySync:
         if rows:
             events = [
                 {
-                    "id": r[0], "t": round(r[1]), "level": r[2],
+                    "id": r[0], "t": round(r[1] + self.clock_offset), "level": r[2],
                     "reasons": json.loads(r[3] or "[]"),
                     "lat": r[4], "lon": r[5], "speed": r[6],
                     **({"driver": cur_code} if cur_code else {}),
@@ -2101,7 +2113,7 @@ class CompanySync:
         if ack:
             ack_note, ack_t = ack
             try:
-                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note, "t": round(ack_t)})
+                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note, "t": round(ack_t + self.clock_offset)})
                 with self.db_lock:
                     if self.pending_ack_note is ack:
                         self.pending_ack_note = None
