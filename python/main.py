@@ -2009,6 +2009,13 @@ class CompanySync:
                         logger.info("Provisioned new company API key automatically from server")
                     except Exception as ke:
                         logger.warning(f"Failed saving provisioned API key: {ke}")
+                elif resp.get("clear_key"):
+                    try:
+                        if os.path.exists(COMPANY_KEY_FILE):
+                            os.remove(COMPANY_KEY_FILE)
+                            logger.info("Cleared company API key per server request")
+                    except Exception as ke:
+                        logger.warning(f"Failed clearing company API key: {ke}")
             self.last_ok, self.last_err = time.time(), None
         except Exception as e:
             self.last_err = str(e)
