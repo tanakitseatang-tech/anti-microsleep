@@ -147,6 +147,8 @@ ROBOFLOW_TIMEOUT_S = 3.0
 AI_VETO_MAX_S = 1.5            # AI "open" may cancel an EAR closure only during its first 1.5 s
 EAR_BORDERLINE = 1.20         # EAR < threshold*1.2 + model says closed -> closed
 ALARM_SOUND = os.path.join(APP_DIR, "sounds", "beep.wav")  # looped only while level = ALARM
+READY_SOUND = os.path.join(APP_DIR, "sounds", "ready.wav")      # once: camera + face AI running
+LEARNED_SOUND = os.path.join(APP_DIR, "sounds", "learned.wav")  # once each time a driver's eyes are learned
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
 LIVE_JPEG_QUALITY = 70       # live view at http://<board-ip>:7000
 DEBUG_SNAPSHOT = False        # also save debug/frame.jpg every 2 s
@@ -997,7 +999,9 @@ class PersonChecker(threading.Thread):
 # Alarm sound (USB speaker on the Linux side)
 # --------------------------------------------------------------------------
 class AlarmSound(threading.Thread):
-    """Loops a WAV file on the USB speaker while active (ALARM level only)."""
+    """Loops a WAV file on the USB speaker while active (ALARM level only).
+    Also plays short one-shot chimes (ready / driver learned) when no alarm is sounding;
+    an alarm always cuts a chime off."""
 
     BLOCK_S = 0.05     # 50 ms blocks -> stops within ~0.1 s when the alarm ends
 
@@ -1010,17 +1014,58 @@ class AlarmSound(threading.Thread):
             self.pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).copy()
         self.block = int(self.rate * self.BLOCK_S) * self.channels
         self.active = threading.Event()
+        self.chimes = deque(maxlen=3)
         self.spk = None
         self.next_try = 0.0
         self.warned = False
         logger.info(f"Alarm sound loaded: {os.path.basename(path)} "
                     f"{len(self.pcm) / self.channels / self.rate:.1f}s {self.rate}Hz x{self.channels}")
 
+    def load_clip(self, path):
+        """Load a one-shot WAV (must match the alarm's rate/channels, 16-bit). None if unusable."""
+        try:
+            with wave.open(path, "rb") as w:
+                if (w.getsampwidth(), w.getframerate(), w.getnchannels()) != (2, self.rate, self.channels):
+                    raise ValueError(f"needs 16-bit {self.rate}Hz x{self.channels}")
+                return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).copy()
+        except Exception as e:
+            logger.warning(f"Sound {os.path.basename(path)} not used: {e}")
+            return None
+
+    def play_once(self, pcm):
+        if pcm is not None:
+            self.chimes.append(pcm)
+
     def set_active(self, on):
         if on:
             self.active.set()
         else:
             self.active.clear()
+
+    def _speaker_ready(self):
+        if self.spk is None and time.monotonic() >= self.next_try:
+            self._open()
+        return self.spk is not None
+
+    def _write(self, chunk):
+        try:
+            self.spk.play(chunk)
+            return True
+        except Exception as e:
+            logger.warning(f"Speaker write failed ({e}); reopening")
+            try:
+                self.spk.stop()
+            except Exception:
+                pass
+            self.spk = None
+            return False
+
+    def _play_chime(self, pcm):
+        if not self._speaker_ready():
+            return                            # no speaker: skip the chime (never queue forever)
+        for pos in range(0, len(pcm), self.block):
+            if self.active.is_set() or not self._write(pcm[pos:pos + self.block]):
+                return
 
     def _open(self):
         try:
@@ -1038,26 +1083,19 @@ class AlarmSound(threading.Thread):
     def run(self):
         pos = 0
         while True:
-            if not self.active.wait(timeout=0.5):
+            if not self.active.is_set():
                 pos = 0                       # next alarm starts from the beginning
+                if self.chimes:
+                    self._play_chime(self.chimes.popleft())
+                else:
+                    self.active.wait(timeout=0.1)
                 continue
-            if self.spk is None:
-                if time.monotonic() >= self.next_try:
-                    self._open()
-                if self.spk is None:
-                    time.sleep(0.2)
-                    continue
+            if not self._speaker_ready():
+                time.sleep(0.2)
+                continue
             chunk = self.pcm[pos:pos + self.block]
             pos = (pos + self.block) % len(self.pcm)
-            try:
-                self.spk.play(chunk)
-            except Exception as e:
-                logger.warning(f"Speaker write failed ({e}); reopening")
-                try:
-                    self.spk.stop()
-                except Exception:
-                    pass
-                self.spk = None
+            self._write(chunk)
 
 
 # --------------------------------------------------------------------------
@@ -1118,11 +1156,16 @@ else:
     logger.info(f"Roboflow eye model off: no API key in {ROBOFLOW_KEY_FILE}")
 
 alarm_sound = None
+ready_pcm = learned_pcm = None
 try:
     alarm_sound = AlarmSound(ALARM_SOUND)
+    ready_pcm = alarm_sound.load_clip(READY_SOUND)
+    learned_pcm = alarm_sound.load_clip(LEARNED_SOUND)
     alarm_sound.start()
 except Exception as e:
     logger.warning(f"Alarm sound disabled: {e}")
+ready_chime_done = False          # "system ready" chime plays once per app start
+was_calibrated = False            # for the "driver learned" chime
 camera = None
 next_camera_try = 0.0
 last_log = 0.0
@@ -1816,7 +1859,7 @@ def open_camera():
 
 
 def loop():
-    global camera, last_log, frames, last_level, current_fps
+    global camera, last_log, frames, last_level, current_fps, ready_chime_done, was_calibrated
 
     if camera is None:
         mcu.send(0, ST_NO_CAMERA)
@@ -1887,6 +1930,16 @@ def loop():
     mcu.send(s["level"], s["status"])
     if alarm_sound is not None:
         alarm_sound.set_active(s["level"] == 2)       # RED only, never on WARNING
+    if not ready_chime_done:                          # first frame through camera + face AI
+        ready_chime_done = True
+        logger.info("System ready (camera + face AI running) - ready chime")
+        if alarm_sound is not None:
+            alarm_sound.play_once(ready_pcm)
+    if detector.calibrated and not was_calibrated:
+        logger.info("Driver's eyes learned - learned chime")
+        if alarm_sound is not None:
+            alarm_sound.play_once(learned_pcm)
+    was_calibrated = detector.calibrated
     live.publish_stats(s, current_fps)
     live.publish_frame(frame, pts, s)
     frames += 1
