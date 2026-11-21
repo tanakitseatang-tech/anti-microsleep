@@ -156,8 +156,11 @@ FACE_VOICE = os.path.join(APP_DIR, "sounds", "voice_face.wav")          # "ก�
 NO_DRIVER_VOICE_S = 30.0
 NO_DRIVER_REPORT_S = 60.0
 # Rest mode: the driver picks a rest length on the driver page; face checks pause meanwhile.
-# The phone is the alarm clock. The company website sends LINE if the rest runs 15 min over.
+# The board is the alarm clock: when the rest time is up the speaker rings (beep.wav) until the
+# driver sits in front of the camera or presses "ขับต่อ", for at most REST_ALARM_MAX_S.
+# (Board off = engine off: no ring; the company website sends LINE if the rest runs 15 min over.)
 REST_CHOICES_MIN = (15, 30, 60)
+REST_ALARM_MAX_S = 10 * 60
 REST_CANCEL_KMH = 15.0          # a live GPS fix this fast during a rest = driving -> rest cancelled
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
 SPEAKER_VOLUME = "60%"          # USB speaker hardware volume (alarm + voice prompts)
@@ -1685,6 +1688,11 @@ class DriverLog:
             self._save_shift()
             return was
 
+    def rest_ringing(self, now=None):
+        """Rest time is up and the driver is not back yet: the speaker rings (max REST_ALARM_MAX_S)."""
+        ru = self.rest_until
+        return ru is not None and 0 <= (now or time.time()) - ru < REST_ALARM_MAX_S
+
     def rest_state(self, now=None):
         """None = not resting, "rest" = rest time running, "over" = rest time is up, driver not back yet."""
         ru = self.rest_until
@@ -1714,6 +1722,7 @@ def _driver_state():
         "driver_code": dcode, "driver_name": dname, "drivers": dmap,
         "pending_alert_at": pending_at, "pending_level": pending_lvl,
         "rest_until": driver_log.rest_until, "rest_minutes": driver_log.rest_minutes,
+        "rest_ringing": driver_log.rest_ringing(),
         "rest_choices": list(REST_CHOICES_MIN),
         "events": events[-100:],
     }
@@ -2052,7 +2061,7 @@ def loop():
     if camera is None:
         mcu.send(0, ST_NO_CAMERA)
         if alarm_sound is not None:
-            alarm_sound.set_active(False)
+            alarm_sound.set_active(driver_log.rest_ringing())   # rest alarm still rings
         live.stats = {"status": "NO_CAMERA", "level": "OK", "level_num": 0, "time": time.time()}
         if time.monotonic() >= next_camera_try:
             open_camera()
@@ -2101,7 +2110,7 @@ def loop():
         return
     if was_resting:
         was_resting = False
-        logger.info("Rest time is up: face checks running again")
+        logger.info("Rest time is up: face checks running again, speaker rings until the driver is back")
 
     t = time.monotonic()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -2172,7 +2181,8 @@ def loop():
                     f" smile={s['smiling']}")
     mcu.send(s["level"], s["status"])
     if alarm_sound is not None:
-        alarm_sound.set_active(s["level"] == 2)       # RED only, never on WARNING
+        # RED only, never on WARNING; also rings when the rest time is up and the driver is not back
+        alarm_sound.set_active(s["level"] == 2 or (rest == "over" and driver_log.rest_ringing()))
     # Voice prompts: "learning" at start-up, and again when a face appears for a new
     # learning round (driver change / reset); "ready" each time the eyes are learned.
     first_frame = not system_started
