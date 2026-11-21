@@ -101,6 +101,13 @@
   .dock .btn { min-height: 58px; font-size: 17px; }
   .rest-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .countdown { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--ok); }
+  .countdown.over { color: var(--warn); }
+  .dock-btns.three { grid-template-columns: repeat(3, 1fr); }
+  .dock-btns.three .btn { min-height: 64px; font-size: 20px; }
+  .rest-alarm { margin: 10px 0; padding: 10px 12px; border-radius: 14px; background: rgba(0,0,0,.25);
+                font-size: 18px; font-weight: 700; line-height: 1.35; }
+  .rest-alarm b { font-size: 24px; }
+  .dock .btn.small { min-height: 48px; font-size: 16px; }
 
   /* ---------------------------------------------------------------- panel: bottom sheet (phone) / side panel (PC) */
   .panel { position: fixed; z-index: 1050; background: var(--panel); display: flex; flex-direction: column; }
@@ -235,15 +242,27 @@
   <div class="dock-title" id="ackTitle">⚠️ มีการแจ้งเตือนความง่วง</div>
   <div class="dock-btns">
     <button class="btn ok" id="ackAwakeBtn">✅ ฉันตื่นแล้ว</button>
-    <button class="btn" id="ackBreakBtn">☕ แวะพักรถแล้ว</button>
+    <button class="btn" id="ackBreakBtn">☕ จอดพักรถแล้ว</button>
   </div>
 </section>
+<!-- rest: pick how long, then the phone is the alarm clock -->
+<section class="dock" id="restPickBox" hidden role="dialog" aria-labelledby="restPickTitle">
+  <div class="dock-title" id="restPickTitle">☕ จอดรถแล้ว จะพักกี่นาที? (ระบบหยุดตรวจจับระหว่างพัก — กดเมื่อจอดแล้วเท่านั้น)</div>
+  <div class="dock-btns three">
+    <button class="btn ok" data-rest="15">15 นาที</button>
+    <button class="btn ok" data-rest="30">30 นาที</button>
+    <button class="btn ok" data-rest="60">60 นาที</button>
+  </div>
+  <button class="btn ghost small" id="restPickCancel" style="margin-top:10px">ยกเลิก</button>
+</section>
 <section class="dock" id="restTimerBox" hidden>
-  <div class="dock-title">☕ กำลังพักรถ · แนะนำพัก 15 นาทีหลังแจ้งเตือน</div>
+  <div class="dock-title" id="restTitle">☕ กำลังพักรถ</div>
   <div class="rest-row">
     <div class="countdown" id="restCountdown">15:00</div>
     <button class="btn primary" id="resumeDriveBtn" style="width:auto">▶️ พักเสร็จ ขับต่อ</button>
   </div>
+  <div class="rest-alarm" id="restAlarmTxt">⏰ ตั้งปลุกในมือถือเวลา <b id="restAlarmTime">--:--</b> น.</div>
+  <button class="btn small" id="phoneAlarmBtn">📱 ตั้งนาฬิกาปลุกในมือถือ</button>
 </section>
 
 <aside class="panel" id="panel" aria-label="ข้อมูลการขับ">
@@ -287,7 +306,7 @@
           <div class="sub" id="shiftSub"></div>
           <div class="meter"><i id="meter"></i></div>
           <div class="row2">
-            <button class="btn" id="breakBtn">☕ พักแล้ว</button>
+            <button class="btn" id="breakBtn">☕ พักรถ</button>
             <button class="btn ghost" id="endBtn">จบกะ</button>
           </div>
         </div>
@@ -623,8 +642,9 @@ const TH = [
 ];
 const th = (r) => { for (const [re, f] of TH) { const m = r.match(re); if (m) return f(m); } return r; };
 const thAll = (rs) => (rs || []).map(th).join(" · ");
-const onlyNoFace = (ev) => ev.reasons.length > 0 && ev.reasons.every(r => r.startsWith("face not visible"));
+const onlyNoFace = (ev) => ev.reasons.length > 0 && ev.reasons.every(r => r.startsWith("face not visible") || r.startsWith("driver not visible"));
 const STATUS_TEXT = { NO_CAMERA: ["📷", "ไม่พบกล้อง", "ตรวจสายกล้อง"], LOW_LIGHT: ["🌙", "มืดเกินไป", "กล้องมองไม่เห็น"],
+                      RESTING: ["☕", "กำลังพักรถ", "ระบบหยุดตรวจจับระหว่างพัก"],
                       NO_FACE: ["👤", "ไม่เห็นใบหน้า", "นั่งหันหน้าเข้ากล้อง"] };
 const LEVEL_TEXT = [["🟢", "ปกติ"], ["🟡", "เริ่มง่วง ระวัง!"], ["🔴", "อันตราย! ตื่น!"]];
 const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s / 3600)}:${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}`; };
@@ -632,7 +652,8 @@ const fmtClock = (t) => new Date(t * 1000).toLocaleTimeString("th-TH", { hour: "
 
 let state = null, lastOk = 0;
 let driverProfile = store.get("ams_driver_code", "");
-let restUntil = Number(store.get("ams_rest_until", 0));
+let restPickOpen = false;
+store.del("ams_rest_until");            // old phone-only rest timer (the board keeps the rest now)
 $("driverNameInput").value = driverProfile;
 
 function normCode(v) {
@@ -658,8 +679,31 @@ $("driverNameInput").addEventListener("input", () => {
   updateDriverPreview();
 });
 
-function startRestTimer(minutes = 15) { restUntil = Date.now() + minutes * 60 * 1000; store.set("ams_rest_until", String(restUntil)); render(); }
-function stopRestTimer() { restUntil = 0; store.del("ams_rest_until"); render(); }
+// Rest: the driver picks 15/30/60 min -> the board pauses face checks; the phone is the alarm clock.
+function openRestPicker() { restPickOpen = true; render(); }
+function closeRestPicker() { restPickOpen = false; render(); }
+async function startRest(minutes) {
+  restPickOpen = false;
+  await post("/api/driver/rest", { action: "start", minutes });
+  await pollOnce();
+  if (state && state.rest_until) setPhoneAlarm(state.rest_until);
+}
+async function endRest() { await post("/api/driver/rest", { action: "end" }); pollOnce(); }
+const hhmm = (sec) => { const d = new Date(sec * 1000); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+// Phone alarm: Android -> open the Clock app with the time filled in; iPhone (and any phone where
+// that is blocked) -> show the time to set by hand. Websites cannot set an iPhone alarm themselves.
+function setPhoneAlarm(untilSec) {
+  const d = new Date(untilSec * 1000), t = hhmm(untilSec);
+  const manual = () => alert(`⏰ เปิดแอป "นาฬิกา" ในมือถือ แล้วตั้งปลุกเวลา ${t} น.\n\nระบบในรถหยุดตรวจจับระหว่างพัก — ถ้าพักเกินเวลา 15 นาที บริษัทจะได้รับแจ้งเตือน`);
+  if (/Android/i.test(navigator.userAgent)) {
+    const msg = encodeURIComponent("หมดเวลาพัก กลับไปขับต่อ");
+    location.href = `intent:#Intent;action=android.intent.action.SET_ALARM;i.android.intent.extra.alarm.HOUR=${d.getHours()};i.android.intent.extra.alarm.MINUTES=${d.getMinutes()};S.android.intent.extra.alarm.MESSAGE=${msg};B.android.intent.extra.alarm.SKIP_UI=false;end`;
+    // still on this page after 2 s = the Clock app did not open (blocked) -> tell the time instead
+    setTimeout(() => { if (!document.hidden) manual(); }, 2000);
+  } else {
+    manual();
+  }
+}
 
 function render() {
   const d = state; if (!d) return;
@@ -684,15 +728,28 @@ function render() {
   // alert acknowledgement (always on top) or the rest countdown
   const needAck = !!d.pending_alert_at || d.level > 0;
   const ackRed = d.level === 2 || d.pending_level === 2;
-  const restRemS = Math.max(0, Math.ceil((restUntil - Date.now()) / 1000));
-  $("ackBox").hidden = !needAck;
+  const resting = !!d.rest_until;
+  $("restPickBox").hidden = !restPickOpen;
+  $("ackBox").hidden = !needAck || restPickOpen || resting;
   $("ackBox").className = "dock " + (ackRed ? "red" : "warn");
   $("ackTitle").textContent = ackRed
     ? "🚨 แจ้งเตือนหลับใน! กดยืนยันเมื่อตื่นหรือแวะพักแล้ว"
     : "⚠️ แจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว";
-  $("restTimerBox").hidden = needAck || restRemS <= 0;
-  if (restRemS > 0) $("restCountdown").textContent = `${String(Math.floor(restRemS / 60)).padStart(2, "0")}:${String(restRemS % 60).padStart(2, "0")}`;
-  $("status").style.visibility = needAck || restRemS > 0 ? "hidden" : "";
+  $("restTimerBox").hidden = !resting || restPickOpen;
+  if (resting) {
+    const rem = Math.round(d.rest_until - d.now);          // board clock, not the phone's
+    const a = Math.abs(rem);
+    const mmss = `${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+    $("restCountdown").textContent = rem >= 0 ? mmss : "+" + mmss;
+    $("restCountdown").className = "countdown" + (rem < 0 ? " over" : "");
+    $("restTitle").textContent = rem >= 0
+      ? `☕ กำลังพักรถ ${d.rest_minutes || ""} นาที · ระบบหยุดตรวจจับ`
+      : "⏰ หมดเวลาพักแล้ว! นั่งหน้ากล้องหรือกดขับต่อ (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
+    $("restAlarmTime").textContent = hhmm(d.rest_until);
+    $("restAlarmTxt").hidden = rem < 0;
+    $("phoneAlarmBtn").hidden = rem < 0;
+  }
+  $("status").style.visibility = needAck || resting || restPickOpen ? "hidden" : "";
 
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const evs = (d.events || []).filter(e => e.t * 1000 >= today.getTime() && !onlyNoFace(e)).reverse();
@@ -729,11 +786,14 @@ function render() {
   if (show && !userPicked && selType !== "rest_area" && nav && nav.nearest && nav.nearest.rest_area) selectType("rest_area");
 }
 
-async function pollDriver() {
+async function pollOnce() {
   try {
     const r = await fetch("/api/driver", { cache: "no-store" });
     state = await r.json(); lastOk = Date.now(); render();
   } catch (e) {}
+}
+async function pollDriver() {
+  await pollOnce();
   const alive = Date.now() - lastOk < 4000;
   $("dot").classList.toggle("on", alive);
   $("conn").textContent = alive ? "เชื่อมต่อบอร์ดแล้ว" : "เชื่อมต่อบอร์ดไม่ได้";
@@ -751,15 +811,18 @@ $("startBtn").onclick = async () => {
   driverProfile = code;
   store.set("ams_driver_code", code);
   await post("/api/shift", { action: "start", driver_code: code });
-  pollDriver();
+  pollOnce();
 };
-$("breakBtn").onclick = () => { startRestTimer(15); post("/api/shift", { action: "break" }); };
-$("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { stopRestTimer(); await post("/api/shift", { action: "end" }); pollDriver(); } };
-$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollDriver(); };
-$("ackBreakBtn").onclick = async () => { startRestTimer(15); await post("/api/driver/ack", { kind: "break" }); pollDriver(); };
-$("resumeDriveBtn").onclick = () => stopRestTimer();
-$("testWarnBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 1 }); pollDriver(); };
-$("testAlarmBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 2 }); pollDriver(); };
+$("breakBtn").onclick = openRestPicker;
+$("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { await post("/api/shift", { action: "end" }); pollOnce(); } };
+$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollOnce(); };
+$("ackBreakBtn").onclick = openRestPicker;         // picking a rest length also answers the alert
+document.querySelectorAll("#restPickBox [data-rest]").forEach((b) => { b.onclick = () => startRest(Number(b.dataset.rest)); });
+$("restPickCancel").onclick = closeRestPicker;
+$("resumeDriveBtn").onclick = endRest;
+$("phoneAlarmBtn").onclick = () => { if (state && state.rest_until) setPhoneAlarm(state.rest_until); };
+$("testWarnBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 1 }); pollOnce(); };
+$("testAlarmBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 2 }); pollOnce(); };
 
 // start: PC shows the side panel, phone starts with the small sheet (remember the last choice)
 const saved = store.get("ams_panel", "");
