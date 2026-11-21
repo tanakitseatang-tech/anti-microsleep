@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.error
@@ -147,9 +148,11 @@ ROBOFLOW_TIMEOUT_S = 3.0
 AI_VETO_MAX_S = 1.5            # AI "open" may cancel an EAR closure only during its first 1.5 s
 EAR_BORDERLINE = 1.20         # EAR < threshold*1.2 + model says closed -> closed
 ALARM_SOUND = os.path.join(APP_DIR, "sounds", "beep.wav")  # looped only while level = ALARM
-READY_SOUND = os.path.join(APP_DIR, "sounds", "ready.wav")      # once: camera + face AI running
-LEARNED_SOUND = os.path.join(APP_DIR, "sounds", "learned.wav")  # once each time a driver's eyes are learned
+# Thai voice prompts (Microsoft neural voice th-TH-Premwadee, 44.1 kHz stereo like beep.wav)
+LEARNING_VOICE = os.path.join(APP_DIR, "sounds", "voice_learning.wav")  # "กรุณานั่งตามปกติ มองไปข้างหน้า ระบบกำลังเรียนรู้ดวงตา"
+READY_VOICE = os.path.join(APP_DIR, "sounds", "voice_ready.wav")        # "ระบบพร้อมใช้งาน"
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
+SPEAKER_VOLUME = "60%"          # USB speaker hardware volume (alarm + voice prompts)
 LIVE_JPEG_QUALITY = 70       # live view at http://<board-ip>:7000
 DEBUG_SNAPSHOT = False        # also save debug/frame.jpg every 2 s
 DEBUG_DIR = os.path.join(APP_DIR, "debug")
@@ -1000,8 +1003,8 @@ class PersonChecker(threading.Thread):
 # --------------------------------------------------------------------------
 class AlarmSound(threading.Thread):
     """Loops a WAV file on the USB speaker while active (ALARM level only).
-    Also plays short one-shot chimes (ready / driver learned) when no alarm is sounding;
-    an alarm always cuts a chime off."""
+    Also plays short one-shot voice prompts (learning / ready) when no alarm is sounding;
+    an alarm always cuts a prompt off."""
 
     BLOCK_S = 0.05     # 50 ms blocks -> stops within ~0.1 s when the alarm ends
 
@@ -1063,9 +1066,29 @@ class AlarmSound(threading.Thread):
     def _play_chime(self, pcm):
         if not self._speaker_ready():
             return                            # no speaker: skip the chime (never queue forever)
+        # 0.4 s of silence first: a USB speaker that was idle or just opened
+        # swallows the start of the sound while it wakes up
+        lead = np.zeros(int(self.rate * 0.4) * self.channels, dtype=np.int16)
+        pcm = np.concatenate([lead, pcm])
         for pos in range(0, len(pcm), self.block):
             if self.active.is_set() or not self._write(pcm[pos:pos + self.block]):
                 return
+
+    @staticmethod
+    def _set_volume():
+        """Turn the USB speaker's own volume up (it starts at 40 %; resets when replugged)."""
+        try:                          # /proc/asound is not visible in the container -> use /dev/snd
+            cards = sorted(n[8:] for n in os.listdir("/dev/snd") if n.startswith("controlC"))
+            for c in cards:
+                info = subprocess.run(["amixer", "-c", c, "info"], capture_output=True, text=True, timeout=3)
+                if "USB Mixer" not in info.stdout:      # only USB sound cards (speaker / camera mic)
+                    continue
+                r = subprocess.run(["amixer", "-q", "-c", c, "sset", "PCM", SPEAKER_VOLUME, "unmute"],
+                                   capture_output=True, timeout=3)
+                if r.returncode == 0:
+                    logger.info(f"Speaker volume set to {SPEAKER_VOLUME} (card {c})")
+        except Exception as e:
+            logger.warning(f"Could not set speaker volume: {e}")
 
     def _open(self):
         try:
@@ -1073,6 +1096,7 @@ class AlarmSound(threading.Thread):
             spk.start()
             self.spk, self.warned = spk, False
             logger.info("USB speaker ready")
+            self._set_volume()
         except Exception as e:
             self.spk = None
             self.next_try = time.monotonic() + 10.0
@@ -1156,16 +1180,17 @@ else:
     logger.info(f"Roboflow eye model off: no API key in {ROBOFLOW_KEY_FILE}")
 
 alarm_sound = None
-ready_pcm = learned_pcm = None
+learning_pcm = ready_pcm = None
 try:
     alarm_sound = AlarmSound(ALARM_SOUND)
-    ready_pcm = alarm_sound.load_clip(READY_SOUND)
-    learned_pcm = alarm_sound.load_clip(LEARNED_SOUND)
+    learning_pcm = alarm_sound.load_clip(LEARNING_VOICE)
+    ready_pcm = alarm_sound.load_clip(READY_VOICE)
     alarm_sound.start()
 except Exception as e:
     logger.warning(f"Alarm sound disabled: {e}")
-ready_chime_done = False          # "system ready" chime plays once per app start
-was_calibrated = False            # for the "driver learned" chime
+system_started = False            # first frame through camera + face AI seen
+learning_said = False             # "learning your eyes" said for the current learning round
+was_calibrated = False            # for the "ready" prompt
 camera = None
 next_camera_try = 0.0
 last_log = 0.0
@@ -1468,8 +1493,20 @@ DATA_DIR = os.path.join(APP_DIR, "data")
 TRUCK_ID_FILE = os.path.join(APP_DIR, "truck_id.txt")   # e.g. "7" (one per board)
 EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
 SHIFT_FILE = os.path.join(DATA_DIR, "shift.json")
+DRIVERS_CACHE_FILE = os.path.join(DATA_DIR, "drivers.json")
 EVENTS_KEEP = 500             # newest events kept in memory / served to the page
 BREAK_EVERY_S = 2 * 3600      # remind the driver to rest after 2 h of driving
+
+
+def _norm_driver_code(raw):
+    s = str(raw or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("EMP") and s[3:].isdigit():
+        s = s[3:]
+    if s.isdigit() and len(s) <= 3:
+        return s.zfill(3)
+    return s[:20]
 
 
 def _read_truck_id():
@@ -1489,6 +1526,9 @@ class DriverLog:
         self.events = deque(maxlen=EVENTS_KEEP)
         self.shift_start = None
         self.last_break = None
+        self.driver_code = ""
+        self.driver_name = ""
+        self.drivers_map = {}
         self.pending_alert_at = None
         self.pending_level = 0
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -1502,9 +1542,18 @@ class DriverLog:
         except FileNotFoundError:
             pass
         try:
-            with open(SHIFT_FILE) as f:
+            with open(DRIVERS_CACHE_FILE, encoding="utf-8") as f:
+                dm = json.load(f)
+            if isinstance(dm, dict):
+                self.drivers_map = {str(k): str(v) for k, v in dm.items()}
+        except Exception:
+            pass
+        try:
+            with open(SHIFT_FILE, encoding="utf-8") as f:
                 d = json.load(f)
             self.shift_start, self.last_break = d.get("start"), d.get("last_break")
+            self.driver_code = _norm_driver_code(d.get("driver_code", ""))
+            self.driver_name = str(d.get("driver_name", "") or "") or self.drivers_map.get(self.driver_code, "")
         except Exception:
             pass
 
@@ -1537,26 +1586,70 @@ class DriverLog:
 
     def _save_shift(self):
         try:
-            with open(SHIFT_FILE, "w") as f:
-                json.dump({"start": self.shift_start, "last_break": self.last_break}, f)
+            with open(SHIFT_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "start": self.shift_start,
+                    "last_break": self.last_break,
+                    "driver_code": self.driver_code,
+                    "driver_name": self.driver_name,
+                }, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"cannot save shift: {e}")
 
-    def shift(self, action):
+    def update_drivers_cache(self, drivers_list=None, matched_driver=None):
+        changed = False
+        with self.lock:
+            if isinstance(drivers_list, list):
+                new_map = {}
+                for item in drivers_list:
+                    if isinstance(item, dict) and item.get("code") and item.get("name"):
+                        c = _norm_driver_code(item["code"])
+                        if c:
+                            new_map[c] = str(item["name"])
+                if new_map != self.drivers_map:
+                    self.drivers_map = new_map
+                    changed = True
+            if isinstance(matched_driver, dict) and matched_driver.get("name"):
+                mc = _norm_driver_code(matched_driver.get("code", ""))
+                if mc:
+                    self.drivers_map[mc] = str(matched_driver["name"])
+                    if self.driver_code == mc and self.driver_name != str(matched_driver["name"]):
+                        self.driver_name = str(matched_driver["name"])
+                        self._save_shift()
+            elif self.driver_code and self.driver_code in self.drivers_map:
+                if self.driver_name != self.drivers_map[self.driver_code]:
+                    self.driver_name = self.drivers_map[self.driver_code]
+                    self._save_shift()
+            if changed:
+                try:
+                    with open(DRIVERS_CACHE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(self.drivers_map, f, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"cannot save drivers cache: {e}")
+
+    def shift(self, action, driver_code=None):
         now = time.time()
         with self.lock:
             if action == "start":
                 self.shift_start, self.last_break = now, now
+                if driver_code is not None:
+                    code = _norm_driver_code(driver_code)
+                    self.driver_code = code
+                    self.driver_name = self.drivers_map.get(code, "")
             elif action == "break":
                 self.last_break = now
             elif action == "end":
                 self.shift_start = self.last_break = None
+                self.driver_code = ""
+                self.driver_name = ""
             self._save_shift()
+            return self.driver_code, self.driver_name
 
     def snapshot(self):
         with self.lock:
             return (list(self.events), self.shift_start, self.last_break,
-                    self.pending_alert_at, self.pending_level)
+                    self.pending_alert_at, self.pending_level,
+                    self.driver_code, self.driver_name, dict(self.drivers_map))
 
 
 driver_log = DriverLog()
@@ -1564,13 +1657,14 @@ TRUCK_ID = _read_truck_id()
 
 
 def _driver_state():
-    events, start, last_break, pending_at, pending_lvl = driver_log.snapshot()
+    events, start, last_break, pending_at, pending_lvl, dcode, dname, dmap = driver_log.snapshot()
     s = live.stats
     return {
         "truck": TRUCK_ID, "now": time.time(),
         "level": s.get("level_num", 0), "status": s.get("status"),
         "reasons": s.get("reasons", []), "perclos": s.get("perclos"), "yawns": s.get("yawns"),
         "shift_start": start, "last_break": last_break, "break_every_s": BREAK_EVERY_S,
+        "driver_code": dcode, "driver_name": dname, "drivers": dmap,
         "pending_alert_at": pending_at, "pending_level": pending_lvl,
         "events": events[-100:],
     }
@@ -1580,14 +1674,16 @@ def _driver_shift(body: dict = Body(...)):
     action = str(body.get("action", ""))
     if action not in ("start", "break", "end"):
         return {"ok": False, "error": "bad action"}
-    driver_log.shift(action)
+    raw_code = body.get("driver_code") if "driver_code" in body else body.get("driver")
+    dcode, dname = driver_log.shift(action, driver_code=raw_code if action == "start" else None)
     if action == "break":
         sec = driver_log.ack()
         company_sync.enqueue_ack(
             f"คนขับกดแวะพักรถแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับกดแวะพักรถแล้ว"
         )
-    logger.info(f"Driver shift: {action}")
-    return {"ok": True}
+    company_sync.wake()
+    logger.info(f"Driver shift: {action} code={dcode or '-'}")
+    return {"ok": True, "driver_code": dcode, "driver_name": dname}
 
 
 def _driver_ack(body: dict = Body(...)):
@@ -1790,9 +1886,14 @@ class CompanySync:
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
         }
+        cur_code = driver_log.driver_code
+        if cur_code:
+            hb["driver_code"] = cur_code
         hb.update(_host_network())                  # board Wi-Fi IP + network name (for /go QR)
         try:
-            self._post(f"{base}/api/ingest/heartbeat", key, hb)
+            resp = self._post(f"{base}/api/ingest/heartbeat", key, hb)
+            if isinstance(resp, dict):
+                driver_log.update_drivers_cache(resp.get("drivers"), resp.get("driver"))
             self.last_ok, self.last_err = time.time(), None
         except Exception as e:
             self.last_err = str(e)
@@ -1808,6 +1909,7 @@ class CompanySync:
                     "id": r[0], "t": round(r[1]), "level": r[2],
                     "reasons": json.loads(r[3] or "[]"),
                     "lat": r[4], "lon": r[5], "speed": r[6],
+                    **({"driver": cur_code} if cur_code else {}),
                 }
                 for r in rows
             ]
@@ -1859,7 +1961,7 @@ def open_camera():
 
 
 def loop():
-    global camera, last_log, frames, last_level, current_fps, ready_chime_done, was_calibrated
+    global camera, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
 
     if camera is None:
         mcu.send(0, ST_NO_CAMERA)
@@ -1930,15 +2032,23 @@ def loop():
     mcu.send(s["level"], s["status"])
     if alarm_sound is not None:
         alarm_sound.set_active(s["level"] == 2)       # RED only, never on WARNING
-    if not ready_chime_done:                          # first frame through camera + face AI
-        ready_chime_done = True
-        logger.info("System ready (camera + face AI running) - ready chime")
+    # Voice prompts: "learning" at start-up, and again when a face appears for a new
+    # learning round (driver change / reset); "ready" each time the eyes are learned.
+    first_frame = not system_started
+    system_started = True
+    if first_frame:
+        logger.info("System started (camera + face AI running)")
+    if detector.calibrated:
+        learning_said = False
+        if not was_calibrated:
+            logger.info("Driver's eyes learned - voice: ready")
+            if alarm_sound is not None:
+                alarm_sound.play_once(ready_pcm)
+    elif not learning_said and (first_frame or pts is not None):
+        learning_said = True
+        logger.info("Learning the driver's eyes - voice: learning")
         if alarm_sound is not None:
-            alarm_sound.play_once(ready_pcm)
-    if detector.calibrated and not was_calibrated:
-        logger.info("Driver's eyes learned - learned chime")
-        if alarm_sound is not None:
-            alarm_sound.play_once(learned_pcm)
+            alarm_sound.play_once(learning_pcm)
     was_calibrated = detector.calibrated
     live.publish_stats(s, current_fps)
     live.publish_frame(frame, pts, s)
