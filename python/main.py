@@ -66,6 +66,8 @@ EYES_CLOSED_WARN_S = 1.0      # eyes closed this long -> WARNING
 EYES_CLOSED_ALARM_S = 2.0     # eyes closed this long -> ALARM (microsleep)
 SQUINT_CLOSED_WARN_S = 1.5    # closure seen only as "narrow + no iris" (glasses / squint):
 SQUINT_CLOSED_ALARM_S = 3.0   # ...warn / alarm a bit later, so a squint is not a microsleep
+SQUINT_EXCUSE_MAX_S = 8.0     # a closure that looks like a hard squint (squint_check.py) is excused
+                              # this long at most; after that it counts as closed again (safety net)
 REOPEN_MARGIN = 1.00          # a closure ends only when EAR rises above the squint threshold
 HOLD_AFTER_S = 0.5            # closures longer than this also ride over short "open" flickers
 REOPEN_GRACE_S = 0.3          # ...eyes must look open this long to end the closure
@@ -324,6 +326,7 @@ class DrowsinessDetector:
         self.closed_since = None            # effective closure (after AI veto/confirm)
         self.ear_closed_since = None        # closure according to EAR only
         self.reopen_since = None            # eyes look open again since (hysteresis)
+        self.squint_face_since = None       # closure excused as a hard squint since
         self.ep_min_ear = None              # lowest EAR in the current closure
         self.haar_open = deque(maxlen=60)   # open-eye detector results on clearly open eyes
         self.haar_learn_t = 0.0
@@ -350,6 +353,8 @@ class DrowsinessDetector:
         self.narrow_threshold = EAR_DEFAULT_NARROW
         self.calibrated = False
         self.haar_open.clear()
+        if globals().get("squint_checker") is not None:
+            squint_checker.reset()
 
     def haar_rate(self):
         """How often the open-eye detector finds this driver's open eyes (None = not known yet)."""
@@ -534,6 +539,31 @@ class DrowsinessDetector:
                         s["squint"] = not ear_closed  # narrow but iris visible = squint
                 else:
                     ear_closed = False
+                # --- hard squint vs shut eyes: the eyelid points look shut in both cases, but
+                #     brows, lid curve and the AI expression model differ (squint_check.py) ---
+                sq_face = False
+                checker = globals().get("squint_checker")
+                if checker is not None and frontal and not head_off and self.calibrated:
+                    if ear >= self.squint_threshold:
+                        checker.learn_open(pts)
+                    elif ear_closed or self.ear_closed_since is not None:
+                        try:
+                            sq_face, sq_info = checker.check(pts, t)
+                        except Exception as e:                    # never block an alarm
+                            sq_face, sq_info = False, None
+                            logger.warning(f"squint check error: {e}")
+                        s["sq_info"] = sq_info
+                if sq_face:
+                    if self.squint_face_since is None:
+                        self.squint_face_since = t
+                        logger.info(f"Hard squint, not closed: {s.get('sq_info')}")
+                    if t - self.squint_face_since < SQUINT_EXCUSE_MAX_S:
+                        ear_closed = False
+                        s["squint"] = True
+                    else:
+                        sq_face = False                           # too long: count as closed
+                else:
+                    self.squint_face_since = None
                 # Hysteresis: once the eyes are closed they count as closed until they clearly
                 # reopen. Glasses make EAR / iris flicker around the squint edge, which used to
                 # reset the timer every few frames so the alarm never came.
@@ -542,7 +572,8 @@ class DrowsinessDetector:
                 elif self.ear_closed_since is not None:
                     if haar is not None and haar > 0 and t - self.ear_closed_since < HOLD_AFTER_S:
                         pass                                  # detector sees an open eye: blink over
-                    elif ear < self.squint_threshold * REOPEN_MARGIN and not (haar is not None and haar > 0):
+                    elif (ear < self.squint_threshold * REOPEN_MARGIN
+                          and not (haar is not None and haar > 0) and not sq_face):
                         ear_closed, self.reopen_since = True, None
                         s["squint"] = False
                     elif t - self.ear_closed_since >= HOLD_AFTER_S:
@@ -1056,6 +1087,13 @@ class McuLink:
 # --------------------------------------------------------------------------
 ensure_model()
 engine = FaceMeshEngine(MODEL_PATH, threads=4)
+try:
+    from squint_check import SquintCheck
+    squint_checker = SquintCheck(MODEL_PATH)
+    logger.info("Squint check ready (blendshapes + brows + lid curve)")
+except Exception as e:                      # without it: every closure counts (safe default)
+    squint_checker = None
+    logger.warning(f"Squint check disabled: {e}")
 # smoke test: run once on a blank frame so model errors show up at startup
 engine.process(np.zeros((RESOLUTION[1], RESOLUTION[0], 3), np.uint8))
 logger.info("Face engine ready (LiteRT, 478-point face mesh)")
@@ -1817,6 +1855,16 @@ def loop():
                          ear=detector.ear_buf[-1] if detector.ear_buf else None)
 
     s = detector.update(pts, frame, t)
+    try:                                   # research recorder (only while data/rec_on exists)
+        global _eye_rec
+        if "_eye_rec" not in globals():
+            from eye_research import Recorder
+            _eye_rec = Recorder(APP_DIR, MODEL_PATH, logger)
+        _eye_rec(frame, pts, s, detector, t)
+    except Exception as e:                 # never let research code break detection
+        if t - getattr(loop, "_rec_err_t", 0) > 10:
+            loop._rec_err_t = t
+            logger.warning(f"eye recorder error: {e}")
     if SQUINT_TEST_LOG and pts is not None and s["ear"] is not None and t - getattr(loop, "_sq_t", 0) >= 0.4:
         loop._sq_t = t
         iris = iris_visible_fraction(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), pts)
