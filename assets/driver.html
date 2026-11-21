@@ -277,8 +277,9 @@
       <div class="card">
         <h3>⏱️ เวลาขับ</h3>
         <div id="shiftOff">
-          <div class="sub" style="margin-bottom:8px">ใส่ชื่อหรือรหัสพนักงานก่อนเริ่มกะ</div>
-          <input class="text" id="driverNameInput" placeholder="เช่น EMP001 สมชาย" autocomplete="name">
+          <div class="sub" style="margin-bottom:8px">ใส่รหัสพนักงาน 3 หลักก่อนเริ่มกะ</div>
+          <input class="text" id="driverNameInput" inputmode="numeric" maxlength="3" placeholder="เช่น 001" autocomplete="off">
+          <div class="sub" id="driverPreview" style="margin:-2px 0 8px;min-height:18px"></div>
           <button class="btn primary" id="startBtn">▶️ เริ่มกะขับรถ</button>
         </div>
         <div id="shiftOn" hidden>
@@ -630,16 +631,43 @@ const fmtDur = (s) => { s = Math.max(0, Math.floor(s)); return `${Math.floor(s /
 const fmtClock = (t) => new Date(t * 1000).toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" });
 
 let state = null, lastOk = 0;
-let driverProfile = store.get("ams_driver_name", "");
+let driverProfile = store.get("ams_driver_code", "");
 let restUntil = Number(store.get("ams_rest_until", 0));
 $("driverNameInput").value = driverProfile;
+
+function normCode(v) {
+  const s = String(v || "").replace(/\D/g, "").slice(0, 3);
+  return s;
+}
+function updateDriverPreview() {
+  const raw = normCode($("driverNameInput").value);
+  const el = $("driverPreview");
+  if (!raw) { el.textContent = ""; el.style.color = ""; return; }
+  const pad = raw.length === 3 ? raw : raw.padStart(3, "0");
+  const name = state && state.drivers ? state.drivers[pad] : "";
+  if (name) {
+    el.textContent = `👤 พนักงาน: ${name} (${pad})`;
+    el.style.color = "#4ade80";
+  } else {
+    el.textContent = raw.length === 3 ? `รหัส ${pad} (ระบบบริษัทจะตรวจสอบชื่อให้อัตโนมัติ)` : "กรอกให้ครบ 3 หลัก เช่น 001";
+    el.style.color = "";
+  }
+}
+$("driverNameInput").addEventListener("input", () => {
+  $("driverNameInput").value = normCode($("driverNameInput").value);
+  updateDriverPreview();
+});
 
 function startRestTimer(minutes = 15) { restUntil = Date.now() + minutes * 60 * 1000; store.set("ams_rest_until", String(restUntil)); render(); }
 function stopRestTimer() { restUntil = 0; store.del("ams_rest_until"); render(); }
 
 function render() {
   const d = state; if (!d) return;
-  $("title").textContent = `รถคันที่ ${d.truck}${driverProfile ? " · " + driverProfile : ""}`;
+  const activeCode = d.driver_code || "";
+  const activeName = d.driver_name || (activeCode && d.drivers ? d.drivers[activeCode] : "") || "";
+  const drvTag = activeCode ? (activeName ? `${activeCode} ${activeName}` : `รหัส ${activeCode}`) : "";
+  $("title").textContent = `รถคันที่ ${d.truck}${drvTag ? " · " + drvTag : ""}`;
+  updateDriverPreview();
   const online = navigator.onLine;
   $("syncTxt").textContent = online ? "ซิงก์บริษัทแล้ว" : "ออฟไลน์ (เก็บในคิว)";
   $("syncPill").className = "chip " + (online ? "good" : "warn");
@@ -685,7 +713,7 @@ function render() {
     const since = d.now - (d.last_break || d.shift_start);
     breakDue = since >= d.break_every_s;
     $("drive").textContent = fmtDur(since);
-    $("shiftSub").textContent = breakDue ? "⚠️ ขับนานแล้ว ควรพัก 15 นาที" : `เริ่มกะ ${fmtClock(d.shift_start)} · ควรพักทุก ${d.break_every_s / 3600} ชม.`;
+    $("shiftSub").textContent = (drvTag ? `👤 ${drvTag} · ` : "") + (breakDue ? "⚠️ ขับนานแล้ว ควรพัก 15 นาที" : `เริ่มกะ ${fmtClock(d.shift_start)} · ควรพักทุก ${d.break_every_s / 3600} ชม.`);
     $("meter").style.width = Math.min(100, since / d.break_every_s * 100) + "%";
     $("meter").className = breakDue ? "due" : "";
   }
@@ -715,13 +743,18 @@ async function pollDriver() {
 async function post(url, body) {
   try { await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch (e) {}
 }
-$("startBtn").onclick = () => {
-  const name = $("driverNameInput").value.trim();
-  if (name) { driverProfile = name; store.set("ams_driver_name", name); }
-  post("/api/shift", { action: "start", driver: driverProfile });
+$("startBtn").onclick = async () => {
+  const raw = normCode($("driverNameInput").value);
+  if (!raw) { alert("กรุณาใส่รหัสพนักงาน 3 หลัก เช่น 001"); $("driverNameInput").focus(); return; }
+  const code = raw.padStart(3, "0");
+  $("driverNameInput").value = code;
+  driverProfile = code;
+  store.set("ams_driver_code", code);
+  await post("/api/shift", { action: "start", driver_code: code });
+  pollDriver();
 };
 $("breakBtn").onclick = () => { startRestTimer(15); post("/api/shift", { action: "break" }); };
-$("endBtn").onclick = () => { if (confirm("จบกะตอนนี้?")) { stopRestTimer(); post("/api/shift", { action: "end" }); } };
+$("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { stopRestTimer(); await post("/api/shift", { action: "end" }); pollDriver(); } };
 $("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollDriver(); };
 $("ackBreakBtn").onclick = async () => { startRestTimer(15); await post("/api/driver/ack", { kind: "break" }); pollDriver(); };
 $("resumeDriveBtn").onclick = () => stopRestTimer();
