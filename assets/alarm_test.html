@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ทดสอบตั้งปลุก</title>
+<style>
+  :root { --bg: #0f172a; --card: #1e293b; --fg: #f1f5f9; --muted: #94a3b8; --ok: #22c55e; --bad: #ef4444; --warn: #f59e0b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+         font-family: "Sarabun", "Noto Sans Thai", system-ui, sans-serif; font-size: 17px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 14px; line-height: 1.45; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  select, input { font-size: 17px; padding: 8px 10px; border-radius: 10px; border: 1px solid #334155; background: var(--card); color: var(--fg); }
+  h2 { font-size: 17px; color: var(--muted); margin: 18px 0 8px; }
+  .ways { display: grid; gap: 8px; }
+  button { width: 100%; min-height: 54px; padding: 10px 12px; border-radius: 14px; border: 1px solid #334155;
+           background: var(--card); color: var(--fg); font-size: 16px; font-weight: 700; text-align: left; }
+  button .res { float: right; }
+  .ok { border-color: var(--ok); } .bad { border-color: var(--bad); opacity: .7; } .unk { border-color: var(--warn); }
+  #log { margin-top: 18px; padding: 10px; background: #020617; border-radius: 12px; font: 13px/1.5 ui-monospace, monospace;
+         white-space: pre-wrap; min-height: 60px; }
+  a { color: #93c5fd; }
+</style>
+</head>
+<body>
+<h1>⏰ ทดสอบวิธีตั้งปลุกในมือถือ</h1>
+<p class="sub">กดทีละปุ่ม ✅ = เปิดแอปได้ · ❌ = เครื่องนี้เปิดไม่ได้ · ⚠️ = ไม่แน่ใจ (ดูเองว่าขึ้นอะไร)<br>
+วิธีที่ใช้ได้จะถูกจำไว้ และหน้าคนขับจะใช้วิธีนั้นก่อน · <a href="driver.html">← กลับหน้าคนขับ</a></p>
+<div class="row">ตั้งเวลา <select id="min"><option>1</option><option selected>15</option><option>30</option><option>60</option></select> นาที
+  <span class="sub" id="plat" style="margin:0"></span></div>
+<h2>เครื่องนี้</h2><div class="ways" id="mine"></div>
+<h2>วิธีของระบบอื่น (ลองได้ แต่ส่วนมากจะไม่ทำงาน)</h2><div class="ways" id="others"></div>
+<div id="log"></div>
+<script src="phone_alarm.js"></script>
+<script>
+  const PA = window.PhoneAlarm;
+  const log = (s) => { document.getElementById("log").textContent += `${new Date().toLocaleTimeString("th-TH")}  ${s}\n`; };
+  document.getElementById("plat").textContent = `(ตรวจพบ: ${PA.platform === "android" ? "Android" : PA.platform === "ios" ? "iPhone/iPad" : "คอมพิวเตอร์/อื่น ๆ"})`;
+  log(navigator.userAgent);
+  let saved = null; try { saved = localStorage.getItem("ams_alarm_way"); } catch (e) {}
+  if (saved) log(`วิธีที่จำไว้ตอนนี้: ${saved}`);
+  const mine = new Set(PA.waysFor().map((w) => w.id));
+  for (const w of PA.WAYS) {
+    const b = document.createElement("button");
+    b.innerHTML = `<span class="res"></span>${w.label}<br><small style="color:var(--muted);font-weight:400">${w.id}${w.note ? " · " + w.note : ""}</small>`;
+    b.onclick = () => {
+      const m = Number(document.getElementById("min").value);
+      const end = new Date(Date.now() + m * 60e3);
+      log(`ลอง ${w.id} (${m} นาที → ${PA.hhmm(end)})`);
+      b.className = ""; b.querySelector(".res").textContent = "⏳";
+      PA.launch(w, m, end, ({ ok }) => {
+        b.className = ok === true ? "ok" : ok === null ? "unk" : "bad";
+        b.querySelector(".res").textContent = ok === true ? "✅" : ok === null ? "⚠️" : "❌";
+        log(`${w.id}: ${ok === true ? "เปิดแอปได้ (จำไว้แล้ว)" : ok === null ? "ไม่แน่ใจ" : "เปิดไม่ได้"}`);
+      });
+    };
+    document.getElementById(mine.has(w.id) ? "mine" : "others").append(b);
+  }
+  if (location.hash.startsWith("#alarmfail=")) { log(`Chrome ปฏิเสธ: ${location.hash.slice(11)}`); history.replaceState(null, "", location.pathname); }
+</script>
+</body>
+</html>
