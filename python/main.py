@@ -1859,10 +1859,26 @@ def _nav_indoor_location(body: dict = Body(...)):
     return {"ok": True}
 
 
+def _nav_sim_drive(body: dict = Body(...)):
+    action = str(body.get("action", "toggle")).lower()
+    if action == "stop" or (action == "toggle" and navigator._sim.get("active")):
+        navigator.stop_sim()
+        company_sync.wake()
+        return {"ok": True, "active": False}
+    try:
+        speed = float(body.get("speed", 80.0))
+    except (TypeError, ValueError):
+        speed = 80.0
+    navigator.start_sim(speed_kmh=speed)
+    company_sync.wake()
+    return {"ok": True, "active": True, "speed": speed}
+
+
 ui.expose_api("GET", "/api/nav", _nav_state)
 ui.expose_api("GET", "/api/pois", _nav_pois)
 ui.expose_api("POST", "/api/test_location", _nav_test_location)
 ui.expose_api("POST", "/api/indoor_location", _nav_indoor_location)
+ui.expose_api("POST", "/api/sim_drive", _nav_sim_drive)
 ui.expose_api("GET", "/maps/thailand.pmtiles", _map_file)
 
 
@@ -1893,10 +1909,11 @@ def _host_network():
 
 
 def _company_location():
-    """Position for the company website: only a real satellite fix (live or recently held).
-    Never the indoor test location or an old fix saved before a reboot (the website then keeps
-    showing the last real position with its time)."""
+    """Position for the company website: a live satellite fix or active demo-drive simulation.
+    Never the static indoor test location or an old fix saved before a reboot."""
     loc = navigator.location()
+    if loc.get("source") == "sim":
+        return loc
     if loc.get("source") == "gps" and not loc.get("stale"):
         return loc
     return {"lat": None, "lon": None, "speed": None}

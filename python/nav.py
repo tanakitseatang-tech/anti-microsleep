@@ -146,6 +146,11 @@ class Navigator:
         self.osrm = f"http://{_docker_host_ip()}:{OSRM_PORT}"
         self.osrm_ok = None
         self.result, self._last_at, self._last_t = {}, None, 0.0
+        self._sim = {
+            "active": False, "pts": [], "seg": 0, "dist": 0.0,
+            "speed_kmh": 80.0, "t": 0.0, "lat": None, "lon": None,
+            "course": 120.0, "name": "บางนา-ตราด → ชลบุรี (จำลอง)",
+        }
         logger.info(f"Rest stops loaded: {len(self.index.pois)} (OSM {self.index.updated}); router {self.osrm}")
 
     # ------------------------------------------------------------ location
@@ -308,9 +313,89 @@ class Navigator:
             self.gps = g
             self._save_last_gps(g)
 
+    def start_sim(self, speed_kmh=80.0):
+        """Start driving along a real Thai highway (Bang Na -> Chonburi) for indoor demos."""
+        speed = max(20.0, min(120.0, float(speed_kmh or 80.0)))
+        start_pt, end_pt = (13.6682, 100.6340), (13.3611, 100.9847)
+        pts = None
+        coords = f"{start_pt[1]:.6f},{start_pt[0]:.6f};{end_pt[1]:.6f},{end_pt[0]:.6f}"
+        for base in (self.osrm, "https://router.project-osrm.org"):
+            try:
+                u = f"{base}/route/v1/driving/{coords}?overview=full&geometries=geojson"
+                with urllib.request.urlopen(u, timeout=4.0) as r:
+                    d = json.load(r)
+                if d.get("code") == "Ok" and d.get("routes"):
+                    pts = [(c[1], c[0]) for c in d["routes"][0]["geometry"]["coordinates"]]
+                    if len(pts) >= 2:
+                        break
+            except Exception:
+                continue
+        if not pts or len(pts) < 2:
+            # Offline fallback waypoints along Bang Na-Trad / Highway 34 -> Chonburi
+            pts = [
+                (13.6682, 100.6340), (13.6572, 100.6780), (13.6408, 100.7155),
+                (13.6115, 100.7580), (13.5880, 100.8120), (13.5685, 100.8750),
+                (13.5320, 100.9280), (13.4850, 100.9680), (13.4220, 100.9860),
+                (13.3611, 100.9847),
+            ]
+        course = bearing_deg(pts[0][0], pts[0][1], pts[1][0], pts[1][1])
+        with self.lock:
+            self._sim = {
+                "active": True, "pts": pts, "seg": 0, "dist": 0.0,
+                "speed_kmh": speed, "t": time.monotonic(),
+                "lat": pts[0][0], "lon": pts[0][1], "course": course,
+                "name": "บางนา-ตราด → ชลบุรี (จำลอง)",
+            }
+            self._last_at = None
+        self.log.info(f"Demo drive simulator started ({len(pts)} road points, {speed:.0f} km/h)")
+        return True
+
+    def stop_sim(self):
+        with self.lock:
+            self._sim["active"] = False
+            self._last_at = None
+        self.log.info("Demo drive simulator stopped")
+        return False
+
+    def _step_sim(self):
+        s = self._sim
+        pts = s["pts"]
+        if not s["active"] or len(pts) < 2:
+            return None
+        now = time.monotonic()
+        dt = max(0.0, min(5.0, now - s["t"]))
+        s["t"] = now
+        move_m = dt * (s["speed_kmh"] / 3.6)
+        seg, dist = s["seg"], s["dist"] + move_m
+        while seg < len(pts) - 1:
+            a, b = pts[seg], pts[seg + 1]
+            seg_len = max(0.5, haversine_m(a[0], a[1], b[0], b[1]))
+            if dist <= seg_len:
+                frac = dist / seg_len
+                s["lat"] = a[0] + (b[0] - a[0]) * frac
+                s["lon"] = a[1] + (b[1] - a[1]) * frac
+                s["course"] = round(bearing_deg(a[0], a[1], b[0], b[1]), 1)
+                s["seg"], s["dist"] = seg, dist
+                return dict(s)
+            dist -= seg_len
+            seg += 1
+        # Loop back to start cleanly
+        s["seg"], s["dist"] = 0, 0.0
+        s["lat"], s["lon"] = pts[0]
+        s["course"] = round(bearing_deg(pts[0][0], pts[0][1], pts[1][0], pts[1][1]), 1)
+        return dict(s)
+
     def location(self):
         with self.lock:
+            sim = self._step_sim() if self._sim.get("active") else None
             g, last_fix, test = dict(self.gps), self._last_fix, self.test_loc
+        if sim is not None:
+            return {
+                "gps": 1, "sats": 9, "mcu_age": 0.0, "indoor": False,
+                "lat": sim["lat"], "lon": sim["lon"], "speed": sim["speed_kmh"],
+                "course": sim["course"], "source": "sim", "sim": True,
+                "route_name": sim["name"],
+            }
         age = time.time() - g["t"] if g.get("t") else None
         fresh = age is not None and age < GPS_STALE_S
         gps_state = g.get("state", -1) if fresh else (1 if last_fix else -1)
