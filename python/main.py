@@ -2000,6 +2000,15 @@ class CompanySync:
             resp = self._post(f"{base}/api/ingest/heartbeat", key, hb)
             if isinstance(resp, dict):
                 driver_log.update_drivers_cache(resp.get("drivers"), resp.get("driver"))
+                new_key = resp.get("provision_key")
+                if isinstance(new_key, str) and new_key.startswith("ams_") and len(new_key) >= 20:
+                    try:
+                        with open(COMPANY_KEY_FILE, "w", encoding="utf-8") as kf:
+                            kf.write(new_key.strip() + "\n")
+                        os.chmod(COMPANY_KEY_FILE, 0o600)
+                        logger.info("Provisioned new company API key automatically from server")
+                    except Exception as ke:
+                        logger.warning(f"Failed saving provisioned API key: {ke}")
             self.last_ok, self.last_err = time.time(), None
         except Exception as e:
             self.last_err = str(e)
