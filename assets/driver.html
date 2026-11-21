@@ -108,14 +108,6 @@
                 font-size: 18px; font-weight: 700; line-height: 1.35; }
   .rest-alarm b { font-size: 24px; }
   .dock .btn.small { min-height: 48px; font-size: 16px; }
-  .alarm-ways { display: grid; gap: 8px; max-height: 38vh; overflow-y: auto; }
-  .alarm-ways .btn { min-height: 52px; font-size: 16px; text-align: left; justify-content: flex-start; }
-  .alarm-ways .btn.best { border: 2px solid var(--ok); }
-  .alarm-ways .btn.failed { opacity: .5; }
-  .alarm-status { min-height: 20px; margin-top: 8px; font-size: 15px; font-weight: 700; }
-  .sc-help { margin-top: 8px; font-size: 15px; line-height: 1.5; }
-  .sc-help summary { cursor: pointer; font-weight: 700; }
-  .sc-help ol { margin: 6px 0 0; padding-left: 22px; }
 
   /* ---------------------------------------------------------------- panel: bottom sheet (phone) / side panel (PC) */
   .panel { position: fixed; z-index: 1050; background: var(--panel); display: flex; flex-direction: column; }
@@ -267,23 +259,10 @@
   <div class="dock-title" id="restTitle">☕ กำลังพักรถ</div>
   <div class="rest-row">
     <div class="countdown" id="restCountdown">15:00</div>
-    <button class="btn primary" id="resumeDriveBtn" style="width:auto">▶️ พักเสร็จ ขับต่อ</button>
+    <button class="btn primary" id="resumeDriveBtn" style="width:auto">▶️ ขับต่อ</button>
   </div>
-  <div id="phoneAlarmBox">
-    <div class="rest-alarm" id="restAlarmTxt">⏰ ปลุกเวลา <b id="restAlarmTime">--:--</b> น. · กดตั้งในมือถือ ↓</div>
-    <div class="alarm-ways" id="alarmWays"></div>
-    <div class="alarm-status" id="alarmStatus"></div>
-    <details class="sc-help" id="shortcutHelp" hidden>
-      <summary>📲 iPhone: สร้างคำสั่งลัด "พักรถ" (ทำครั้งเดียว ตั้งเวลาอัตโนมัติ)</summary>
-      <ol>
-        <li>เปิดแอป <b>คำสั่งลัด</b> (Shortcuts) → แตะ <b>＋</b></li>
-        <li>ตั้งชื่อว่า <b>พักรถ</b> (ต้องตรงทุกตัว)</li>
-        <li>แตะ <b>เพิ่มการกระทำ</b> → ค้นหา “ตัวจับเวลา” → เลือก <b>เริ่มตัวจับเวลา</b></li>
-        <li>แตะช่องเวลา → เลือก <b>อินพุตคำสั่งลัด</b> → หน่วย <b>นาที</b></li>
-        <li>แตะ <b>เสร็จสิ้น</b> · ครั้งแรกที่กดจากหน้านี้ iPhone จะถาม ให้กด <b>อนุญาต</b></li>
-      </ol>
-    </details>
-  </div>
+  <div class="rest-alarm" id="restAlarmTxt">🔔 ลำโพงในรถจะปลุกเวลา <b id="restAlarmTime">--:--</b> น.<br>
+    <small>อย่าดับเครื่อง/ถอดปลั๊กบอร์ด ไม่งั้นจะไม่มีเสียงปลุก</small></div>
 </section>
 
 <aside class="panel" id="panel" aria-label="ข้อมูลการขับ">
@@ -373,7 +352,6 @@
 
 <script src="vendor/leaflet.js"></script>
 <script src="vendor/protomaps-leaflet.js"></script>
-<script src="phone_alarm.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const TYPE_ICON = { fuel: "⛽", rest_area: "🅿️", cafe: "☕" };
@@ -704,52 +682,16 @@ $("driverNameInput").addEventListener("input", () => {
 // Rest: the driver picks 15/30/60 min -> the board pauses face checks; the phone is the alarm clock.
 function openRestPicker() { restPickOpen = true; render(); }
 function closeRestPicker() { restPickOpen = false; render(); }
+// Rest: the driver picks 15/30/60 min -> the board pauses face checks and its speaker rings when
+// the time is up (until the driver sits in front of the camera or presses "ขับต่อ").
 async function startRest(minutes) {
   restPickOpen = false;
-  // open the phone's clock right away, while this tap still counts (phone_alarm.js)
-  const end = new Date(Date.now() + minutes * 60e3);
-  alarmUntil = Math.round(end.getTime() / 1000);
-  buildAlarmWays();
-  const first = window.PhoneAlarm ? PhoneAlarm.waysFor()[0] : null;
-  if (first) tryAlarmWay(first, minutes, end);
   await post("/api/driver/rest", { action: "start", minutes });
   pollOnce();
 }
 async function endRest() { await post("/api/driver/rest", { action: "end" }); pollOnce(); }
 const hhmm = (sec) => { const d = new Date(sec * 1000); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
-// Phone alarm buttons: every way to set an alarm/timer on this phone (phone_alarm.js).
-// The way that opened the Clock app last time is listed first and tried automatically.
-let alarmUntil = 0, alarmWaysFor = 0;
-function buildAlarmWays() {
-  if (!window.PhoneAlarm || alarmWaysFor === alarmUntil) return;
-  alarmWaysFor = alarmUntil;
-  const box = $("alarmWays"); box.innerHTML = "";
-  PhoneAlarm.waysFor().forEach((w, i) => {
-    const b = document.createElement("button");
-    b.className = "btn small" + (i === 0 ? " best" : ""); b.dataset.way = w.id;
-    b.textContent = w.label + (w.note ? ` — ${w.note}` : "");
-    b.onclick = () => {
-      const left = Math.max(1, Math.round((alarmUntil * 1000 - Date.now()) / 60e3));
-      tryAlarmWay(w, left, new Date(alarmUntil * 1000));
-    };
-    box.append(b);
-  });
-  $("shortcutHelp").hidden = !PhoneAlarm.isIOS;
-  $("alarmStatus").textContent = "";
-}
-function tryAlarmWay(way, minutes, end) {
-  $("alarmStatus").textContent = "⏳ กำลังเปิด… " + way.label;
-  PhoneAlarm.launch(way, minutes, end, ({ ok }) => {
-    const btn = document.querySelector(`#alarmWays [data-way="${way.id}"]`);
-    if (ok === true) $("alarmStatus").textContent = "✅ เปิดแอปแล้ว — ตรวจว่าตั้งเวลาถูก";
-    else if (ok === null) $("alarmStatus").textContent = "📅 ถ้าขึ้นหน้าปฏิทิน ให้กดเพิ่ม · ถ้าไม่ขึ้น ลองปุ่มอื่น";
-    else {
-      if (btn) btn.classList.add("failed");
-      $("alarmStatus").textContent = `❌ เครื่องนี้เปิดวิธีนี้ไม่ได้ — ลองปุ่มถัดไป หรือตั้งปลุกเองเวลา ${hhmm(alarmUntil)} น.`;
-    }
-  });
-}
 
 function render() {
   const d = state; if (!d) return;
@@ -790,11 +732,11 @@ function render() {
     $("restCountdown").className = "countdown" + (rem < 0 ? " over" : "");
     $("restTitle").textContent = rem >= 0
       ? `☕ กำลังพักรถ ${d.rest_minutes || ""} นาที · ระบบหยุดตรวจจับ`
-      : "⏰ หมดเวลาพักแล้ว! นั่งหน้ากล้องหรือกดขับต่อ (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
+      : d.rest_ringing
+        ? "🔔 หมดเวลาพักแล้ว! นั่งหน้ากล้องหรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก"
+        : "⏰ หมดเวลาพักแล้ว! (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
     $("restAlarmTime").textContent = hhmm(d.rest_until);
-    if (Math.abs(alarmUntil - d.rest_until) > 5) alarmUntil = Math.round(d.rest_until);  // rest started elsewhere
-    buildAlarmWays();
-    $("phoneAlarmBox").hidden = rem < 0;
+    $("restAlarmTxt").hidden = rem < 0;
   }
   $("status").style.visibility = needAck || resting || restPickOpen ? "hidden" : "";
 
