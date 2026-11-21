@@ -345,8 +345,7 @@
   <div class="label">ทดสอบระบบ (ส่งขึ้นเว็บบริษัท)</div>
   <div class="tests">
     <button class="btn" id="testWarnBtn">🟡 ทดสอบเตือน</button>
-    <button class="btn" id="testAlarmBtn">🔴 ทดสอบหลับใน</button>
-  </div>
+    <button class="btn" id="testAlarmBtn">🔴 ทดสอบหลับใน</button>  </div>
   <div class="foot">Anti-Microsleep Team</div>
 </nav>
 
@@ -733,7 +732,7 @@ function render() {
     $("restTitle").textContent = rem >= 0
       ? `☕ กำลังพักรถ ${d.rest_minutes || ""} นาที · ระบบหยุดตรวจจับ`
       : d.rest_ringing
-        ? "🔔 หมดเวลาพักแล้ว! นั่งหน้ากล้องหรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก"
+        ? "🔔 หมดเวลาพักแล้ว! ลืมตามองกล้อง 3 วินาที หรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก"
         : "⏰ หมดเวลาพักแล้ว! (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
     $("restAlarmTime").textContent = hhmm(d.rest_until);
     $("restAlarmTxt").hidden = rem < 0;
@@ -811,7 +810,6 @@ $("restPickCancel").onclick = closeRestPicker;
 $("resumeDriveBtn").onclick = endRest;
 $("testWarnBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 1 }); pollOnce(); };
 $("testAlarmBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 2 }); pollOnce(); };
-
 // start: PC shows the side panel, phone starts with the small sheet (remember the last choice)
 const saved = store.get("ams_panel", "");
 setPanel(saved === "hidden" ? "hidden" : isDesktop() ? "open" : "peek");
