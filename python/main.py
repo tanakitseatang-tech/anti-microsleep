@@ -1561,6 +1561,21 @@ def _read_truck_id():
         return "1"
 
 
+def _boot_id():
+    """Kernel boot id: time.monotonic() values are comparable only within the same boot."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            b = f.read().strip()
+        if b:
+            return b
+    except Exception:
+        pass
+    return "proc-" + secrets.token_hex(8)        # unknown: trust monotonic only within this process
+
+
+BOOT_ID = _boot_id()
+
+
 class DriverLog:
     """Alert events (level rises to WARNING/ALARM) + shift start, saved under data/."""
 
@@ -1576,6 +1591,9 @@ class DriverLog:
         self.pending_level = 0
         self.rest_until = None        # epoch: driver is resting until then (None = driving)
         self.rest_minutes = None
+        # same deadline on the monotonic clock (immune to NTP steps); valid only while BOOT_ID matches
+        self.rest_mono = None
+        self.rest_boot = None
         os.makedirs(DATA_DIR, exist_ok=True)
         try:
             with open(EVENTS_FILE) as f:
@@ -1602,6 +1620,10 @@ class DriverLog:
             ru = d.get("rest_until")
             if isinstance(ru, (int, float)) and ru > 0:
                 self.rest_until, self.rest_minutes = float(ru), d.get("rest_minutes")
+                rm = d.get("rest_mono")
+                if (d.get("rest_boot") == BOOT_ID and isinstance(rm, (int, float))
+                        and not isinstance(rm, bool) and math.isfinite(rm)):
+                    self.rest_mono, self.rest_boot = float(rm), BOOT_ID   # app restart, same boot
         except Exception:
             pass
 
@@ -1645,6 +1667,8 @@ class DriverLog:
                     "driver_name": self.driver_name,
                     "rest_until": self.rest_until,
                     "rest_minutes": self.rest_minutes,
+                    "rest_mono": self.rest_mono if self.rest_until is not None else None,
+                    "rest_boot": self.rest_boot if self.rest_until is not None else None,
                 }, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"cannot save shift: {e}")
@@ -1686,6 +1710,7 @@ class DriverLog:
             if action == "start":
                 self.shift_start, self.last_break = now, now
                 self.rest_until = self.rest_minutes = None     # a new shift never starts "resting"
+                self.rest_mono = self.rest_boot = None
                 if driver_code is not None:
                     code = _norm_driver_code(driver_code)
                     self.driver_code = code
@@ -1697,12 +1722,15 @@ class DriverLog:
                 self.driver_code = ""
                 self.driver_name = ""
                 self.rest_until = self.rest_minutes = None
+                self.rest_mono = self.rest_boot = None
             self._save_shift()
             return self.driver_code, self.driver_name
 
     def start_rest(self, minutes):
         now = time.time()
         with self.lock:
+            # monotonic deadline first: a reader never pairs a new rest_until with an old deadline
+            self.rest_mono, self.rest_boot = time.monotonic() + minutes * 60, BOOT_ID
             self.rest_until = now + minutes * 60
             self.rest_minutes = minutes
             self.last_break = now
@@ -1713,22 +1741,36 @@ class DriverLog:
         with self.lock:
             was = self.rest_until is not None
             self.rest_until = self.rest_minutes = None
+            self.rest_mono = self.rest_boot = None
             if was:
                 self.last_break = time.time()      # driving time counts again from now
             self._save_shift()
             return was
 
-    def rest_ringing(self, now=None):
-        """Rest time is up and the driver is not back yet: the speaker rings (max REST_ALARM_MAX_S)."""
-        ru = self.rest_until
-        return ru is not None and 0 <= (now or time.time()) - ru < REST_ALARM_MAX_S
-
-    def rest_state(self, now=None):
-        """None = not resting, "rest" = rest time running, "over" = rest time is up, driver not back yet."""
+    def rest_left(self, now=None):
+        """Seconds of rest left (negative = overdue), None = not resting. Uses the monotonic
+        deadline within the same boot (robust to clock jumps), else the saved epoch."""
         ru = self.rest_until
         if ru is None:
             return None
-        return "rest" if (now or time.time()) < ru else "over"
+        if now is None:
+            rm, rb = self.rest_mono, self.rest_boot
+            if rm is not None and rb == BOOT_ID:
+                return rm - time.monotonic()
+            now = time.time()
+        return ru - now
+
+    def rest_ringing(self, now=None):
+        """Rest time is up and the driver is not back yet: the speaker rings (max REST_ALARM_MAX_S)."""
+        left = self.rest_left(now)
+        return left is not None and 0 <= -left < REST_ALARM_MAX_S
+
+    def rest_state(self, now=None):
+        """None = not resting, "rest" = rest time running, "over" = rest time is up, driver not back yet."""
+        left = self.rest_left(now)
+        if left is None:
+            return None
+        return "rest" if left > 0 else "over"
 
     def snapshot(self):
         with self.lock:
@@ -1744,6 +1786,8 @@ TRUCK_ID = _read_truck_id()
 def _driver_state():
     events, start, last_break, pending_at, pending_lvl, dcode, dname, dmap = driver_log.snapshot()
     s = live.stats
+    ok_age, err_age, sync_err = company_sync.health()
+    rest_left = driver_log.rest_left()
     return {
         "truck": TRUCK_ID, "now": time.time(),
         "level": s.get("level_num", 0), "status": s.get("status"),
@@ -1753,18 +1797,33 @@ def _driver_state():
         "pending_alert_at": pending_at, "pending_level": pending_lvl,
         "rest_until": driver_log.rest_until, "rest_minutes": driver_log.rest_minutes,
         "rest_ringing": driver_log.rest_ringing(),
+        # board-measured seconds left (negative = overdue): the page's countdown, immune to clock jumps
+        "rest_left": None if rest_left is None else round(rest_left, 1),
         "rest_choices": list(REST_CHOICES_MIN),
         # real company-sync health (the page used to show the phone's own online flag)
-        "sync_ok_at": company_sync.last_ok, "sync_err": company_sync.last_err,
+        # *_at = wall clock (old fields, kept); *_age = board monotonic seconds ago (None = never)
+        "sync_ok_at": company_sync.last_ok, "sync_err": sync_err,
         "sync_err_at": company_sync.last_err_at,
+        "sync_ok_age": None if ok_age is None else round(ok_age, 1),
+        "sync_err_age": None if err_age is None else round(err_age, 1),
         "events": events[-100:],
     }
 
 
+def _bad_request(msg):
+    """Unknown action/kind or bad value: HTTP 400 (driver.html post() shows the error)."""
+    return JSONResponse({"ok": False, "error": msg}, status_code=400)
+
+
+SHIFT_ACTIONS = ("start", "break", "end")
+ACK_KINDS = ("awake", "break")
+SIM_ACTIONS = ("toggle", "start", "stop")
+
+
 def _driver_shift(body: dict = Body(...)):
     action = str(body.get("action", ""))
-    if action not in ("start", "break", "end"):
-        return {"ok": False, "error": "bad action"}
+    if action not in SHIFT_ACTIONS:
+        return _bad_request(f"action must be one of {list(SHIFT_ACTIONS)}")
     raw_code = body.get("driver_code") if "driver_code" in body else body.get("driver")
     dcode, dname = driver_log.shift(action, driver_code=raw_code if action == "start" else None)
     if action == "break":
@@ -1779,6 +1838,8 @@ def _driver_shift(body: dict = Body(...)):
 
 def _driver_ack(body: dict = Body(...)):
     kind = str(body.get("kind", "awake"))
+    if kind not in ACK_KINDS:
+        return _bad_request(f"kind must be one of {list(ACK_KINDS)}")
     sec = driver_log.ack()
     if kind == "break":
         driver_log.shift("break")
@@ -1813,11 +1874,11 @@ def _driver_rest(body: dict = Body(...)):
         company_sync.wake()
         return {"ok": True, "rest_until": None}
     if action != "start":
-        return {"ok": False, "error": "action must be start or end"}
+        return _bad_request("action must be start or end")
     m = body.get("minutes")
     minutes = m if isinstance(m, int) and not isinstance(m, bool) else None
     if minutes not in REST_CHOICES_MIN:
-        return {"ok": False, "error": f"minutes must be one of {list(REST_CHOICES_MIN)}"}
+        return _bad_request(f"minutes must be one of {list(REST_CHOICES_MIN)}")
     sec = driver_log.ack()                      # pressing rest also answers an open alert
     until = driver_log.start_rest(minutes)
     _reset_detector_timers()
@@ -1866,7 +1927,7 @@ def _nav_test_location(body: dict = Body(...)):
     try:
         navigator.set_test_location(body.get("lat"), body.get("lon"), body.get("course"))
     except (TypeError, ValueError) as e:
-        return {"ok": False, "error": str(e)}
+        return _bad_request(str(e))
     logger.info(f"Test location set: {body.get('lat')}, {body.get('lon')} course {body.get('course')}")
     company_sync.wake()
     return {"ok": True}
@@ -1884,13 +1945,15 @@ def _nav_indoor_location(body: dict = Body(...)):
             body.get("lat"), body.get("lon"), body.get("speed"), body.get("course")
         )
     except (TypeError, ValueError) as e:
-        return {"ok": False, "error": str(e)}
+        return _bad_request(str(e))
     company_sync.wake()
     return {"ok": True}
 
 
 def _nav_sim_drive(body: dict = Body(...)):
     action = str(body.get("action", "toggle")).lower()
+    if action not in SIM_ACTIONS:              # unknown action used to start the demo drive
+        return _bad_request(f"action must be one of {list(SIM_ACTIONS)}")
     if action == "stop" or (action == "toggle" and navigator._sim.get("active")):
         navigator.stop_sim()
         company_sync.wake()
@@ -1952,19 +2015,6 @@ def _company_location():
     return {"lat": None, "lon": None, "speed": None}
 
 
-def _boot_id():
-    """Kernel boot id: time.monotonic() values are comparable only within the same boot."""
-    try:
-        with open("/proc/sys/kernel/random/boot_id") as f:
-            b = f.read().strip()
-        if b:
-            return b
-    except Exception:
-        pass
-    return "proc-" + secrets.token_hex(8)        # unknown: trust monotonic only within this process
-
-
-BOOT_ID = _boot_id()
 QUEUE_MAX_AGE_S = 7 * 24 * 3600       # events the server keeps refusing are dropped after 7 days
 QUEUE_MAX_SKIPS = 10                  # ... or after this many all-refused send attempts
 
@@ -1978,6 +2028,11 @@ class CompanySync:
         self.pending_ack_note = None
         self.last_ok = None
         self.last_err_at = None
+        # same moments on the monotonic clock: the driver page gets ages, immune to clock jumps
+        self.last_ok_mono = None
+        self.last_err_mono = None
+        # queued events the server keeps refusing (heartbeats still pass): a sync problem too
+        self.events_stuck = None
         self.clock_offset = 0.0      # company server time - board time (s), 0 when within a minute
         self.last_err = None
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -2005,6 +2060,19 @@ class CompanySync:
         self._last_err = v
         if v:
             self.last_err_at = time.time()
+            self.last_err_mono = time.monotonic()
+
+    def health(self):
+        """(ok_age, err_age, err) for the driver page: seconds since the last OK / last error on the
+        monotonic clock (None = never). Events stuck in the queue count as an ongoing error (age 0)."""
+        now = time.monotonic()
+        ok_m, err_m, err = self.last_ok_mono, self.last_err_mono, self.last_err
+        ok_age = None if ok_m is None else max(0.0, now - ok_m)
+        err_age = None if (not err or err_m is None) else max(0.0, now - err_m)
+        stuck = self.events_stuck
+        if stuck:
+            err, err_age = (err or stuck), 0.0
+        return ok_age, err_age, err
 
     def _db(self):
         return sqlite3.connect(COMPANY_QUEUE_DB, timeout=10.0)
@@ -2127,7 +2195,7 @@ class CompanySync:
                         logger.warning(f"Failed clearing company API key: {ke}")
             if self.last_err:
                 logger.info("Company sync OK again")
-            self.last_ok, self.last_err = time.time(), None
+            self.last_ok, self.last_ok_mono, self.last_err = time.time(), time.monotonic(), None
         except Exception as e:
             if not self.last_err:                       # log only when it starts failing
                 logger.warning(f"Company sync failing: {e}")
@@ -2167,7 +2235,11 @@ class CompanySync:
                         con.executemany("DELETE FROM queue WHERE id = ?", drop)
                     logger.warning(f"Company server skipped all {len(rows)} queued event(s); "
                                    f"kept {len(rows) - len(drop)}, dropped {len(drop)}")
+                    # heartbeats pass but alerts are not reaching the company: not "synced"
+                    self.events_stuck = (f"เซิร์ฟเวอร์ไม่รับการแจ้งเตือน {len(rows)} รายการ "
+                                         f"(server refused {len(rows)} queued event(s))")
                 else:
+                    self.events_stuck = None
                     with self.db_lock, self._db() as con:
                         con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
                     logger.info(f"Synced {len(rows)} alert event(s) to company server"
@@ -2175,6 +2247,8 @@ class CompanySync:
             except Exception as e:
                 self.last_err = str(e)
                 return
+        else:
+            self.events_stuck = None                    # queue empty: nothing is stuck
 
         with self.db_lock:
             ack = self.pending_ack_note
