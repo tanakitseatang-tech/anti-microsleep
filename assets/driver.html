@@ -299,6 +299,7 @@
           <div class="sub" style="margin-bottom:8px">ใส่รหัสพนักงาน 3 หลักก่อนเริ่มกะ</div>
           <input class="text" id="driverNameInput" inputmode="numeric" maxlength="3" placeholder="เช่น 001" autocomplete="off">
           <div class="sub" id="driverPreview" style="margin:-2px 0 8px;min-height:18px"></div>
+          <div class="sub" style="margin:0 0 8px;font-size:11px;opacity:.8">🔒 PDPA: ประมวลผลภาพบนบอร์ดเท่านั้น ไม่บันทึก/ส่งวิดีโอ ส่งเฉพาะพิกัดและสถานะแจ้งเตือน (ลบอัตโนมัติใน 90 วัน)</div>
           <button class="btn primary" id="startBtn">▶️ เริ่มกะขับรถ</button>
         </div>
         <div id="shiftOn" hidden>
@@ -342,10 +343,6 @@
     <button id="mapModeBtn"><span class="ico">🗺️</span><span id="mapModeTxt">แผนที่ละเอียด (ออนไลน์)</span></button>
     <button id="menuFull"><span class="ico">⛶</span>แผนที่เต็มจอ</button>
   </div>
-  <div class="label">ทดสอบระบบ (ส่งขึ้นเว็บบริษัท)</div>
-  <div class="tests">
-    <button class="btn" id="testWarnBtn">🟡 ทดสอบเตือน</button>
-    <button class="btn" id="testAlarmBtn">🔴 ทดสอบหลับใน</button>  </div>
   <div class="foot">Anti-Microsleep Team</div>
 </nav>
 
@@ -537,6 +534,14 @@ function renderStop() {
     .bindPopup(`${TYPE_ICON[selType]} <b>${esc(n.name || TYPE_NAME[selType])}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
     .addTo(map);
   const here = [nav.loc.lat, nav.loc.lon];
+  const routeKey = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
+  window._onlineRouteCache = window._onlineRouteCache || {};
+  if ((!n.route || n.route.length <= 1) && window._onlineRouteCache[routeKey]) {
+    const cached = window._onlineRouteCache[routeKey];
+    n.route = cached.route;
+    n.road_m = cached.road_m;
+    n.road_s = cached.road_s;
+  }
   if (n.route && n.route.length > 1) {
     // road route like Google Maps: blue line with a dark casing, drawn under the markers
     const path = n.route;
@@ -551,16 +556,21 @@ function renderStop() {
   } else {
     // no local road route (e.g. inside a small soi): draw dashed line now and try the online OSRM full-street route
     nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[selType], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
-    const key = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
-    if (window._onlineRouteKey !== key) {
-      window._onlineRouteKey = key;
+    if (window._onlineRouteKey !== routeKey) {
+      window._onlineRouteKey = routeKey;
       fetch(`https://router.project-osrm.org/route/v1/driving/${here[1]},${here[0]};${n.lon},${n.lat}?overview=full&geometries=geojson`)
         .then(r => r.json())
         .then(d => {
           if (d.routes && d.routes[0]) {
-            n.route = d.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
-            n.road_m = Math.round(d.routes[0].distance);
-            n.road_s = Math.round(d.routes[0].duration);
+            const entry = {
+              route: d.routes[0].geometry.coordinates.map(c => [c[1], c[0]]),
+              road_m: Math.round(d.routes[0].distance),
+              road_s: Math.round(d.routes[0].duration),
+            };
+            window._onlineRouteCache[routeKey] = entry;
+            n.route = entry.route;
+            n.road_m = entry.road_m;
+            n.road_s = entry.road_s;
             renderStop();
           }
         }).catch(() => {});
@@ -808,8 +818,6 @@ $("ackBreakBtn").onclick = openRestPicker;         // picking a rest length also
 document.querySelectorAll("#restPickBox [data-rest]").forEach((b) => { b.onclick = () => startRest(Number(b.dataset.rest)); });
 $("restPickCancel").onclick = closeRestPicker;
 $("resumeDriveBtn").onclick = endRest;
-$("testWarnBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 1 }); pollOnce(); };
-$("testAlarmBtn").onclick = async () => { closeMenu(); await post("/api/driver/test_alert", { level: 2 }); pollOnce(); };
 // start: PC shows the side panel, phone starts with the small sheet (remember the last choice)
 const saved = store.get("ams_panel", "");
 setPanel(saved === "hidden" ? "hidden" : isDesktop() ? "open" : "peek");
