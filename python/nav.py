@@ -15,6 +15,7 @@ import math
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 
 EARTH_R = 6371000.0
@@ -28,7 +29,7 @@ BEHIND_PENALTY = 2.5           # behind-the-truck stops count as this much farth
 RECOMPUTE_S = 5.0
 RECOMPUTE_M = 50.0
 GPS_STALE_S = 6.0
-GPS_FIX_HOLD_S = 3600.0        # keep last valid real GPS fix when walking indoors / into blind spots
+GPS_FIX_HOLD_S = 120.0         # keep last valid real GPS fix briefly indoors; fall back to test_location after 2 min
 OSRM_PORT = 5000
 OSRM_TIMEOUT_S = 2.0
 HEADING_TOL_DEG = 45           # route must leave the truck within +-45 deg of its heading
@@ -322,10 +323,11 @@ class Navigator:
         if gps_state == 1 and (fresh or last_fix):
             src = g if (fresh and g.get("lat") is not None) else last_fix
             # stale = last known position older than the hold time (e.g. saved before a reboot):
-            # still shown on the driver's map, but not reported to the company as live
+            # if a test_location is configured for indoor demo, prefer it over a stale old fix
             stale = src is last_fix and time.time() - last_fix.get("t", 0) >= GPS_FIX_HOLD_S
-            return {**base, "lat": src["lat"], "lon": src["lon"], "speed": src.get("speed", 0.0),
-                    "course": src.get("course"), "source": "gps", "stale": stale}
+            if not stale or not test:
+                return {**base, "lat": src["lat"], "lon": src["lon"], "speed": src.get("speed", 0.0),
+                        "course": src.get("course"), "source": "gps", "stale": stale}
         if test:
             return {**base, "lat": test[0], "lon": test[1], "speed": None, "course": test[2], "source": "test"}
         return {**base, "lat": None, "lon": None, "source": "none"}
@@ -341,8 +343,12 @@ class Navigator:
             tries.insert(0, f"{url}&bearings={bearings}")
         last = None
         for u in tries:
-            with urllib.request.urlopen(u, timeout=OSRM_TIMEOUT_S) as r:
-                d = json.load(r)
+            try:
+                with urllib.request.urlopen(u, timeout=OSRM_TIMEOUT_S) as r:
+                    d = json.load(r)
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}"
+                continue
             if d.get("code") == "Ok":
                 return d
             last = d.get("code")

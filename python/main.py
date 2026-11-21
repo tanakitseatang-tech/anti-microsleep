@@ -1074,6 +1074,7 @@ class AlarmSound(threading.Thread):
             except Exception:
                 pass
             self.spk = None
+            self.next_try = time.monotonic() + 5.0
             return False
 
     def _play_chime(self, pcm):
@@ -1174,6 +1175,7 @@ engine.process(np.zeros((RESOLUTION[1], RESOLUTION[0], 3), np.uint8))
 logger.info("Face engine ready (LiteRT, 478-point face mesh)")
 
 detector = DrowsinessDetector()
+detector_lock = threading.Lock()
 mcu = McuLink()
 person_checker = None
 try:
@@ -1470,7 +1472,8 @@ ui.expose_api("GET", "/api/stats", _stats)
 def _recalibrate(request: Request):
     if not live_auth.ok(request):
         return _unauthorized()
-    detector.recalibrate()
+    with detector_lock:
+        detector.recalibrate()
     return {"ok": True}
 
 
@@ -1754,28 +1757,22 @@ def _driver_ack(body: dict = Body(...)):
         note = f"คนขับแวะพักรถแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับแวะพักรถแล้ว"
     else:
         note = f"คนขับกดยืนยันว่าตื่นแล้ว (ตอบสนองใน {sec} วิ)" if sec else "คนขับกดยืนยันว่าตื่นแล้ว"
-    detector.closed_hist.clear()
-    detector.yawn_times.clear()
-    detector.narrow_since = None
+    # Keep PERCLOS / yawn history: pressing "awake" must not wipe the drowsiness build-up
+    # (a tired driver tapping it again and again would otherwise reset the evidence each time).
+    with detector_lock:
+        detector.narrow_since = None
     company_sync.enqueue_ack(note)
     logger.info(f"Driver ACK ({kind}): {note}")
     return {"ok": True, "note": note}
 
 
-def _driver_test_alert(body: dict = Body(...)):
-    lvl = 2 if int(body.get("level", 2)) >= 2 else 1
-    reasons = ["microsleep 2.2s"] if lvl == 2 else ["eyes closed 1.3s"]
-    driver_log.add(lvl, reasons)
-    company_sync.enqueue(lvl, reasons)
-    logger.info(f"Simulated driver alert level={lvl}")
-    return {"ok": True}
-
 
 def _reset_detector_timers():
     """Rest start/end: forget learned eyes (relearn when the driver sits again) and old timers."""
-    detector.recalibrate()
-    detector.closed_since = detector.ear_closed_since = detector.reopen_since = None
-    detector.no_face_since = detector.away_since = detector.narrow_since = None
+    with detector_lock:
+        detector.recalibrate()
+        detector.closed_since = detector.ear_closed_since = detector.reopen_since = None
+        detector.no_face_since = detector.away_since = detector.narrow_since = None
 
 
 def _driver_rest(body: dict = Body(...)):
@@ -1808,7 +1805,6 @@ ui.expose_api("GET", "/api/driver", _driver_state)
 ui.expose_api("POST", "/api/driver/rest", _driver_rest)
 ui.expose_api("POST", "/api/shift", _driver_shift)
 ui.expose_api("POST", "/api/driver/ack", _driver_ack)
-ui.expose_api("POST", "/api/driver/test_alert", _driver_test_alert)
 
 
 # --------------------------------------------------------------------------
@@ -1927,8 +1923,9 @@ class CompanySync:
         return sqlite3.connect(COMPANY_QUEUE_DB, timeout=10.0)
 
     def enqueue_ack(self, note):
+        # (note, press time): the website closes only cases that happened before the press
         with self.db_lock:
-            self.pending_ack_note = note
+            self.pending_ack_note = (note, time.time())
         self.wake()
 
     def _read_key(self):
@@ -1950,16 +1947,20 @@ class CompanySync:
         return COMPANY_URL_DEFAULT
 
     def enqueue(self, level, reasons):
-        loc = _company_location()
-        uid = f"{int(time.time()*1000)}-{secrets.token_hex(4)}"
-        with self.db_lock, self._db() as con:
-            con.execute(
-                "INSERT OR IGNORE INTO queue (id, t, level, reasons, lat, lon, speed) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (uid, time.time(), int(level), json.dumps(list(reasons)),
-                 loc.get("lat"), loc.get("lon"), loc.get("speed")),
-            )
-        self.wake()
+        try:
+            loc = _company_location()
+            uid = f"{int(time.time()*1000)}-{secrets.token_hex(4)}"
+            with self.db_lock, self._db() as con:
+                con.execute(
+                    "INSERT OR IGNORE INTO queue (id, t, level, reasons, lat, lon, speed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (uid, time.time(), int(level), json.dumps(list(reasons)),
+                     loc.get("lat"), loc.get("lon"), loc.get("speed")),
+                )
+            self.wake()
+        except Exception as e:
+            self.last_err = str(e)
+            logger.warning(f"CompanySync enqueue failed: {e}")
 
     def wake(self):
         self.wake_ev.set()
@@ -1982,6 +1983,7 @@ class CompanySync:
         base = self._read_url()
         loc = _company_location()
         st = live.stats
+        ru = driver_log.rest_until
         hb = {
             "lat": loc.get("lat"),
             "lon": loc.get("lon"),
@@ -1990,7 +1992,7 @@ class CompanySync:
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
             # resting until (epoch s) or None; the company site sends LINE if the rest runs 15 min over
-            "rest_until": round(driver_log.rest_until) if driver_log.rest_until else None,
+            "rest_until": round(ru) if ru else None,
         }
         cur_code = driver_log.driver_code
         if cur_code:
@@ -2045,12 +2047,13 @@ class CompanySync:
                 return
 
         with self.db_lock:
-            ack_note = self.pending_ack_note
-        if ack_note:
+            ack = self.pending_ack_note
+        if ack:
+            ack_note, ack_t = ack
             try:
-                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note})
+                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note, "t": round(ack_t)})
                 with self.db_lock:
-                    if self.pending_ack_note == ack_note:
+                    if self.pending_ack_note is ack:
                         self.pending_ack_note = None
                 logger.info(f"Synced driver ACK to company server: {ack_note}")
             except Exception as e:
@@ -2059,7 +2062,11 @@ class CompanySync:
     def start(self):
         def _run():
             while True:
-                self._step()
+                try:
+                    self._step()
+                except Exception as e:
+                    self.last_err = str(e)
+                    logger.warning(f"CompanySync loop error: {e}")
                 self.wake_ev.wait(timeout=COMPANY_HEARTBEAT_S)
                 self.wake_ev.clear()
         threading.Thread(target=_run, daemon=True).start()
@@ -2071,20 +2078,28 @@ company_sync.start()
 
 def open_camera():
     global camera, next_camera_try
-    try:
-        cam = Camera(CAMERA_SOURCE, resolution=RESOLUTION, fps=FPS)
-        cam.start()
-        camera = cam
-        loop._had_frame, loop._none_since = False, None
-        logger.info(f"Camera started: {CAMERA_SOURCE or 'auto'} {RESOLUTION}@{FPS}")
-    except Exception as e:
-        camera = None
-        next_camera_try = time.monotonic() + 5.0
-        logger.warning(f"No camera yet ({e}). Retrying in 5 s...")
+    sources = []
+    for src in (CAMERA_SOURCE, "usb:0", "usb:1", "usb:2"):
+        if src not in sources:
+            sources.append(src)
+    last_err = None
+    for src in sources:
+        try:
+            cam = Camera(src, resolution=RESOLUTION, fps=FPS)
+            cam.start()
+            camera = cam
+            loop._had_frame, loop._none_since = False, None
+            logger.info(f"Camera started: {src or 'auto'} {RESOLUTION}@{FPS}")
+            return
+        except Exception as e:
+            last_err = e
+    camera = None
+    next_camera_try = time.monotonic() + 5.0
+    logger.warning(f"No camera yet ({last_err}). Retrying in 5 s...")
 
 
 def loop():
-    global camera, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
+    global camera, next_camera_try, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
     global no_driver_since, no_driver_voiced, no_driver_reported, was_resting
 
     ringing = driver_log.rest_ringing()
@@ -2112,6 +2127,7 @@ def loop():
         except Exception:
             pass
         camera = None
+        next_camera_try = time.monotonic() + 1.5
         return
     if frame is None:
         # A USB drop-out (error -71) can make capture() return nothing forever without raising:
@@ -2130,6 +2146,7 @@ def loop():
             except Exception:
                 pass
             camera = None
+            next_camera_try = time.monotonic() + 1.5
             return
         time.sleep(0.01)
         return
@@ -2170,11 +2187,11 @@ def loop():
     pts, _presence = engine.process(rgb)
     if person_checker is not None and pts is None:
         person_checker.submit(frame, t)          # only look for a body when no face is found
-    if eye_model is not None and pts is not None:
-        eye_model.submit(frame, pts, t, urgent=detector.ear_closed_since is not None,
-                         ear=detector.ear_buf[-1] if detector.ear_buf else None)
-
-    s = detector.update(pts, frame, t)
+    with detector_lock:
+        if eye_model is not None and pts is not None:
+            eye_model.submit(frame, pts, t, urgent=detector.ear_closed_since is not None,
+                             ear=detector.ear_buf[-1] if detector.ear_buf else None)
+        s = detector.update(pts, frame, t)
 
     # Rest time is up: the alarm stops only when the driver is in front of the camera with eyes
     # OPEN for REST_AWAKE_S (a driver asleep in the seat also shows a face) or presses "ขับต่อ".
