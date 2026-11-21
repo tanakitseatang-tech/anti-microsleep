@@ -51,6 +51,14 @@
   #login h2 { margin: 0; font-size: 18px; }
   #loginMsg { color: var(--alarm); min-height: 18px; font-size: 13px; }
   #logout { width: auto; padding: 4px 10px; font-size: 12px; margin-left: 8px; }
+  header { flex-wrap: wrap; }
+  .back { display: inline-flex; align-items: center; gap: 6px; height: 42px; padding: 0 16px 0 12px; border-radius: 999px;
+          background: var(--accent); color: #fff; font-weight: 700; font-size: 15px; text-decoration: none; flex: none;
+          box-shadow: 0 2px 8px rgba(78,161,255,.35); }
+  .back:hover { filter: brightness(1.1); }
+  .back .arr { font-size: 20px; line-height: 1; }
+  #login .back { align-self: center; margin-top: 6px; }
+  body.embedded .back, body.embedded header nav { display: none; }
 </style>
 </head>
 <body>
@@ -61,9 +69,11 @@
     <input class="txt" id="loginPw" type="password" autocomplete="current-password" placeholder="รหัสผ่าน" required>
     <button type="submit" id="loginBtn">เข้าสู่ระบบ</button>
     <div id="loginMsg"></div>
+    <a class="back" href="/driver.html"><span class="arr">←</span> กลับหน้าแผนที่คนขับ</a>
   </form>
 </div>
 <header>
+  <a class="back" href="/driver.html" title="กลับหน้าแผนที่คนขับ"><span class="arr">←</span> กลับแผนที่</a>
   <span class="dot" id="dot"></span>
   <h1>ANTI MICROSLEEP · Live</h1>
   <nav style="display:flex; gap:12px; margin-left:14px; font-size:13px">
@@ -136,6 +146,8 @@
   </section>
 </main>
 <script>
+// inside "ภาพสด + แผนที่" (both.html) the outer page has its own back button: hide ours there
+if (window.top !== window.self) document.body.classList.add("embedded");
 const $ = id => document.getElementById(id);
 const LEVEL_TH = ["ปกติ", "เตือน", "อันตราย!"];
 const STATUS_TH = { OK: "เจอใบหน้า ทำงานปกติ", CALIBRATING: "กำลังปรับเกณฑ์… มองกล้อง ลืมตาปกติ",
