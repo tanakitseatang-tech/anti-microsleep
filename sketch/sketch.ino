@@ -179,26 +179,28 @@ void loop() {
   unsigned long now = millis();
   gpsPoll(now);
   unsigned long last = g_lastMsg;
-  bool linkOk = (last != 0) && (now - last < LINK_TIMEOUT_MS);
+  int level = g_level;
+  int status = g_status;
+  bool linkOk = (last != 0) && ((now <= last) || (now - last < LINK_TIMEOUT_MS));
   bool blink = (now / 500) % 2;
 
   if (!linkOk) {                      // Python app not talking to us
     led4(blink, blink, blink);
     setTone(0);
     setMatrix(false);
-  } else if (g_level == 2) {          // ALARM: steady 988 Hz, same tone as beep.wav
+  } else if (level == 2) {            // ALARM: steady 988 Hz, same tone as beep.wav
     bool phase = (now / 200) % 2;
     led4(phase, false, false);
     setTone(ALARM_HZ);
     setMatrix(phase);
-  } else if (g_level == 1) {          // WARNING: light only, no sound
+  } else if (level == 1) {            // WARNING: light only, no sound
     led4(true, true, false);
     setTone(0);
     setMatrix(false);
   } else {                            // OK - show status
     setTone(0);
     setMatrix(false);
-    switch (g_status) {
+    switch (status) {
       case ST_OK:          led4(false, true, false); break;
       case ST_CALIBRATING: led4(false, blink, blink); break;
       case ST_NO_CAMERA:   led4(false, false, blink); break;
