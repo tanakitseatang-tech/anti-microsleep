@@ -342,6 +342,7 @@
   <div class="nav">
     <button id="mapModeBtn"><span class="ico">🗺️</span><span id="mapModeTxt">แผนที่ละเอียด (ออนไลน์)</span></button>
     <button id="menuFull"><span class="ico">⛶</span>แผนที่เต็มจอ</button>
+    <button id="simDriveBtn"><span class="ico">🚗</span><span id="simDriveTxt">จำลองขับรถ 80 กม./ชม.</span></button>
   </div>
   <div class="foot">Anti-Microsleep Team</div>
 </nav>
@@ -435,6 +436,13 @@ $("mapModeBtn").onclick = () => {
   preferDetail = !preferDetail; store.set("ams_map_detail", preferDetail ? "1" : "0");
   if (baseLayer) baseLayer._modeKey = null;
   setBase(!!(nav && nav.offline_map));
+};
+$("simDriveBtn").onclick = async () => {
+  const isSim = nav && nav.loc && nav.loc.source === "sim";
+  await post("/api/sim_drive", { action: isSim ? "stop" : "start", speed: 80 });
+  follow = true;
+  closeMenu();
+  pollNav(true);
 };
 $("zoomIn").onclick = () => map.zoomIn();
 $("zoomOut").onclick = () => map.zoomOut();
@@ -599,12 +607,17 @@ async function pollNav(once) {
     setBase(!!nav.offline_map);
     const loc = nav.loc;
     const spd = loc.speed == null ? "" : ` · ${loc.speed > 0 && loc.speed < 10 ? loc.speed.toFixed(1) : Math.round(loc.speed)} กม./ชม.`;
-    const ok = loc.source === "gps";
-    $("gpsTxt").textContent = ok ? `GPS ${loc.sats || 0} ดวง${loc.indoor ? " (ในอาคาร)" : ""}${spd}`
+    const isSim = loc.source === "sim";
+    const ok = loc.source === "gps" || isSim;
+    $("gpsTxt").textContent = isSim ? `🚗 จำลองขับ${spd}`
+      : loc.source === "gps" ? `GPS ${loc.sats || 0} ดวง${loc.indoor ? " (ในอาคาร)" : ""}${spd}`
       : loc.gps === 0 ? `หาดาวเทียม (${loc.sats || 0})` : "ไม่มี GPS";
-    $("gpsPill").className = "chip " + (ok ? "good" : "warn");
+    $("gpsPill").className = "chip " + (isSim ? "warn" : ok ? "good" : "warn");
     $("gpsPill").title = $("gpsTxt").textContent;
-    $("testnote").hidden = loc.source !== "test";
+    if ($("simDriveTxt")) $("simDriveTxt").textContent = isSim ? "หยุดจำลองขับรถ" : "จำลองขับรถ 80 กม./ชม.";
+    $("testnote").hidden = loc.source !== "test" && !isSim;
+    if (isSim) $("testnote").textContent = `🚗 โหมดจำลองการขับขี่: ${loc.route_name || "ทางหลวงจริง"} (สำหรับสาธิตในอาคาร)`;
+    else $("testnote").textContent = "📍 พิกัดทดสอบในอาคาร (กดค้างบนแผนที่เพื่อย้าย)";
     if (loc.lat != null) {
       const first = !lastLoc;
       lastLoc = loc;
