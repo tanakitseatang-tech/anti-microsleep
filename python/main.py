@@ -151,6 +151,14 @@ ALARM_SOUND = os.path.join(APP_DIR, "sounds", "beep.wav")  # looped only while l
 # Thai voice prompts (Microsoft neural voice th-TH-Premwadee, 44.1 kHz stereo like beep.wav)
 LEARNING_VOICE = os.path.join(APP_DIR, "sounds", "voice_learning.wav")  # "กรุณานั่งตามปกติ มองไปข้างหน้า ระบบกำลังเรียนรู้ดวงตา"
 READY_VOICE = os.path.join(APP_DIR, "sounds", "voice_ready.wav")        # "ระบบพร้อมใช้งาน"
+FACE_VOICE = os.path.join(APP_DIR, "sounds", "voice_face.wav")          # "กรุณาหันหน้าเข้ากล้อง" (optional: skipped if missing)
+# Driver not visible (no face) during a shift, not resting: voice prompt, then report to the company (LINE)
+NO_DRIVER_VOICE_S = 30.0
+NO_DRIVER_REPORT_S = 60.0
+# Rest mode: the driver picks a rest length on the driver page; face checks pause meanwhile.
+# The phone is the alarm clock. The company website sends LINE if the rest runs 15 min over.
+REST_CHOICES_MIN = (15, 30, 60)
+REST_CANCEL_KMH = 15.0          # a live GPS fix this fast during a rest = driving -> rest cancelled
 SPEAKER_DEVICE = Speaker.USB_SPEAKER_1
 SPEAKER_VOLUME = "60%"          # USB speaker hardware volume (alarm + voice prompts)
 LIVE_JPEG_QUALITY = 70       # live view at http://<board-ip>:7000
@@ -1180,11 +1188,12 @@ else:
     logger.info(f"Roboflow eye model off: no API key in {ROBOFLOW_KEY_FILE}")
 
 alarm_sound = None
-learning_pcm = ready_pcm = None
+learning_pcm = ready_pcm = face_pcm = None
 try:
     alarm_sound = AlarmSound(ALARM_SOUND)
     learning_pcm = alarm_sound.load_clip(LEARNING_VOICE)
     ready_pcm = alarm_sound.load_clip(READY_VOICE)
+    face_pcm = alarm_sound.load_clip(FACE_VOICE) if os.path.isfile(FACE_VOICE) else None
     alarm_sound.start()
 except Exception as e:
     logger.warning(f"Alarm sound disabled: {e}")
@@ -1197,6 +1206,10 @@ last_log = 0.0
 current_fps = 0.0
 frames = 0
 last_level = 0
+no_driver_since = None            # shift running, not resting, no face since (monotonic)
+no_driver_voiced = False          # "กรุณาหันหน้าเข้ากล้อง" said for this stretch
+no_driver_reported = False        # company told (event -> LINE) for this stretch
+was_resting = False
 
 
 def annotate(frame, pts, s):
@@ -1531,6 +1544,8 @@ class DriverLog:
         self.drivers_map = {}
         self.pending_alert_at = None
         self.pending_level = 0
+        self.rest_until = None        # epoch: driver is resting until then (None = driving)
+        self.rest_minutes = None
         os.makedirs(DATA_DIR, exist_ok=True)
         try:
             with open(EVENTS_FILE) as f:
@@ -1554,13 +1569,17 @@ class DriverLog:
             self.shift_start, self.last_break = d.get("start"), d.get("last_break")
             self.driver_code = _norm_driver_code(d.get("driver_code", ""))
             self.driver_name = str(d.get("driver_name", "") or "") or self.drivers_map.get(self.driver_code, "")
+            ru = d.get("rest_until")
+            if isinstance(ru, (int, float)) and ru > 0:
+                self.rest_until, self.rest_minutes = float(ru), d.get("rest_minutes")
         except Exception:
             pass
 
     def add(self, level, reasons):
         now = time.time()
         ev = {"t": now, "level": level, "reasons": list(reasons)}
-        only_no_face = reasons and all(str(r).startswith("face not visible") for r in reasons)
+        only_no_face = reasons and all(str(r).startswith(("face not visible", "driver not visible"))
+                                       for r in reasons)
         with self.lock:
             self.events.append(ev)
             if not only_no_face:
@@ -1592,6 +1611,8 @@ class DriverLog:
                     "last_break": self.last_break,
                     "driver_code": self.driver_code,
                     "driver_name": self.driver_name,
+                    "rest_until": self.rest_until,
+                    "rest_minutes": self.rest_minutes,
                 }, f, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"cannot save shift: {e}")
@@ -1642,8 +1663,34 @@ class DriverLog:
                 self.shift_start = self.last_break = None
                 self.driver_code = ""
                 self.driver_name = ""
+                self.rest_until = self.rest_minutes = None
             self._save_shift()
             return self.driver_code, self.driver_name
+
+    def start_rest(self, minutes):
+        now = time.time()
+        with self.lock:
+            self.rest_until = now + minutes * 60
+            self.rest_minutes = minutes
+            self.last_break = now
+            self._save_shift()
+            return self.rest_until
+
+    def end_rest(self):
+        with self.lock:
+            was = self.rest_until is not None
+            self.rest_until = self.rest_minutes = None
+            if was:
+                self.last_break = time.time()      # driving time counts again from now
+            self._save_shift()
+            return was
+
+    def rest_state(self, now=None):
+        """None = not resting, "rest" = rest time running, "over" = rest time is up, driver not back yet."""
+        ru = self.rest_until
+        if ru is None:
+            return None
+        return "rest" if (now or time.time()) < ru else "over"
 
     def snapshot(self):
         with self.lock:
@@ -1666,6 +1713,8 @@ def _driver_state():
         "shift_start": start, "last_break": last_break, "break_every_s": BREAK_EVERY_S,
         "driver_code": dcode, "driver_name": dname, "drivers": dmap,
         "pending_alert_at": pending_at, "pending_level": pending_lvl,
+        "rest_until": driver_log.rest_until, "rest_minutes": driver_log.rest_minutes,
+        "rest_choices": list(REST_CHOICES_MIN),
         "events": events[-100:],
     }
 
@@ -1711,7 +1760,41 @@ def _driver_test_alert(body: dict = Body(...)):
     return {"ok": True}
 
 
+def _reset_detector_timers():
+    """Rest start/end: forget learned eyes (relearn when the driver sits again) and old timers."""
+    detector.recalibrate()
+    detector.closed_since = detector.ear_closed_since = detector.reopen_since = None
+    detector.no_face_since = detector.away_since = detector.narrow_since = None
+
+
+def _driver_rest(body: dict = Body(...)):
+    """{"action": "start", "minutes": 15|30|60} or {"action": "end"} (driver back, drives on)."""
+    action = str(body.get("action", "start"))
+    if action == "end":
+        was = driver_log.end_rest()
+        if was:
+            logger.info("Driver rest ended (driver pressed: drive on)")
+        company_sync.wake()
+        return {"ok": True, "rest_until": None}
+    try:
+        minutes = int(body.get("minutes", 15))
+    except (TypeError, ValueError):
+        minutes = 15
+    if minutes not in REST_CHOICES_MIN:
+        return {"ok": False, "error": f"minutes must be one of {list(REST_CHOICES_MIN)}"}
+    sec = driver_log.ack()                      # pressing rest also answers an open alert
+    until = driver_log.start_rest(minutes)
+    _reset_detector_timers()
+    note = f"คนขับเริ่มพักรถ {minutes} นาที"
+    if sec:
+        note += f" (ตอบสนองใน {sec} วิ)"
+    company_sync.enqueue_ack(note)
+    logger.info(f"Driver rest started: {minutes} min (until {time.strftime('%H:%M', time.localtime(until))})")
+    return {"ok": True, "rest_until": until, "minutes": minutes}
+
+
 ui.expose_api("GET", "/api/driver", _driver_state)
+ui.expose_api("POST", "/api/driver/rest", _driver_rest)
 ui.expose_api("POST", "/api/shift", _driver_shift)
 ui.expose_api("POST", "/api/driver/ack", _driver_ack)
 ui.expose_api("POST", "/api/driver/test_alert", _driver_test_alert)
@@ -1784,7 +1867,7 @@ COMPANY_URL_FILE = os.path.join(APP_DIR, "company_url.txt")
 COMPANY_KEY_FILE = os.path.join(APP_DIR, "company_api_key.txt")
 COMPANY_QUEUE_DB = os.path.join(DATA_DIR, "company_queue.sqlite")
 COMPANY_HEARTBEAT_S = 5.0
-APP_VERSION = "2026-11-20"
+APP_VERSION = "2026-11-21"
 
 
 HOST_IP_FILE = os.path.join(DATA_DIR, "host_ip.json")   # written by tools/host_ip.sh on the board
@@ -1885,6 +1968,8 @@ class CompanySync:
             "level": st.get("level_num", 0),
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
+            # resting until (epoch s) or None; the company site sends LINE if the rest runs 15 min over
+            "rest_until": round(driver_log.rest_until) if driver_log.rest_until else None,
         }
         cur_code = driver_log.driver_code
         if cur_code:
@@ -1962,6 +2047,7 @@ def open_camera():
 
 def loop():
     global camera, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
+    global no_driver_since, no_driver_voiced, no_driver_reported, was_resting
 
     if camera is None:
         mcu.send(0, ST_NO_CAMERA)
@@ -1990,6 +2076,33 @@ def loop():
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
+    # Rest mode: the driver picked a rest length on the driver page. No face checks while
+    # it runs (no alarms, much less CPU = cooler board). The phone is the alarm clock.
+    rest = driver_log.rest_state()
+    if rest is not None and time.monotonic() - getattr(loop, "_rest_gps_t", 0) >= 2.0:
+        loop._rest_gps_t = time.monotonic()
+        loc = navigator.location()                # live satellite fix says the truck is driving?
+        if (loc.get("source") == "gps" and not loc.get("indoor")
+                and (loc.get("speed") or 0) >= REST_CANCEL_KMH):
+            driver_log.end_rest()
+            company_sync.wake()
+            logger.info(f"Rest cancelled: truck moving {loc['speed']:.0f} km/h")
+            rest = None
+    if rest == "rest":
+        if not was_resting:
+            was_resting = True
+            logger.info("Rest mode: face checks paused")
+        mcu.send(0, ST_OK)
+        if alarm_sound is not None:
+            alarm_sound.set_active(False)
+        live.stats = {"status": "RESTING", "level": "OK", "level_num": 0, "time": time.time()}
+        no_driver_since, no_driver_voiced, no_driver_reported = None, False, False
+        time.sleep(0.5)
+        return
+    if was_resting:
+        was_resting = False
+        logger.info("Rest time is up: face checks running again")
+
     t = time.monotonic()
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pts, _presence = engine.process(rgb)
@@ -2000,6 +2113,34 @@ def loop():
                          ear=detector.ear_buf[-1] if detector.ear_buf else None)
 
     s = detector.update(pts, frame, t)
+
+    # Rest time is up and the driver's face is back -> rest over, normal driving.
+    if rest == "over" and pts is not None:
+        driver_log.end_rest()
+        company_sync.wake()
+        rest = None
+        logger.info("Driver back after rest (face seen): rest ended")
+    # Driver not visible during a shift (not resting): voice at 30 s, company + LINE at 60 s.
+    # While a rest is overdue the company website handles it (LINE 15 min after rest end).
+    if pts is None and rest is None and driver_log.shift_start:
+        if no_driver_since is None:
+            no_driver_since = t
+        gone = t - no_driver_since
+        if gone >= NO_DRIVER_VOICE_S and not no_driver_voiced:
+            no_driver_voiced = True
+            logger.info(f"Driver not visible {gone:.0f}s - voice: face the camera")
+            if alarm_sound is not None:
+                alarm_sound.play_once(face_pcm)
+        if gone >= NO_DRIVER_REPORT_S and not no_driver_reported:
+            no_driver_reported = True
+            why = "camera dark" if s["status"] == ST_LOW_LIGHT else "no face"
+            reasons = [f"driver not visible {gone:.0f}s ({why})"]
+            driver_log.add(1, reasons)
+            company_sync.enqueue(1, reasons)
+            logger.info(f"Driver not visible {gone:.0f}s - reported to the company")
+    else:
+        no_driver_since, no_driver_voiced, no_driver_reported = None, False, False
+
     try:                                   # research recorder (only while data/rec_on exists)
         global _eye_rec
         if "_eye_rec" not in globals():
