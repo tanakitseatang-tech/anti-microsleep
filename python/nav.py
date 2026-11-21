@@ -190,7 +190,8 @@ class Navigator:
             with open(self.test_file) as f:
                 d = json.load(f)
             c = d.get("course")
-            return float(d["lat"]), float(d["lon"]), (None if c is None else float(c) % 360)
+            c = None if c is None or not math.isfinite(float(c)) else float(c) % 360
+            return float(d["lat"]), float(d["lon"]), c
         except Exception:
             return None
 
@@ -199,7 +200,10 @@ class Navigator:
         lat, lon = float(lat), float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("bad coordinates")
-        course = None if course in (None, "") else float(course) % 360
+        course = None if course in (None, "") else float(course)
+        if course is not None and not math.isfinite(course):   # nan/inf would break /api/nav for good
+            raise ValueError("bad course")
+        course = None if course is None else course % 360
         with open(self.test_file, "w") as f:
             json.dump({"lat": lat, "lon": lon, "course": course}, f)
         with self.lock:
@@ -294,6 +298,10 @@ class Navigator:
         lat, lon = float(lat), float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("bad coordinates")
+        if speed is not None and not math.isfinite(float(speed)):
+            speed = None
+        if course is not None and not math.isfinite(float(course)):
+            course = None
         now = time.time()
         with self.lock:
             # Only override if hardware satellite GPS is not actively locked right this second

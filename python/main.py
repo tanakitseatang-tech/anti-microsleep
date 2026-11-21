@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -1292,16 +1293,35 @@ class LiveView:
                 self.cond.notify_all()
 
     def frames(self):
-        last = -1
+        # Without new frames (camera unplugged) the generator used to wait forever without
+        # sending anything, so a closed browser tab was never noticed and each reload leaked a
+        # worker thread. Now it re-sends a frame (or a "NO CAMERA" picture) every 2 s.
+        last, last_sent = -1, 0.0
         while True:
             self.last_fetch = time.monotonic()
             with self.cond:
                 self.cond.wait_for(lambda: self.seq != last, timeout=1.0)
                 jpeg, seq = self.jpeg, self.seq
+            now = time.monotonic()
             if jpeg is None or seq == last:
-                continue
-            last = seq
+                if now - last_sent < 2.0:
+                    continue
+                jpeg = jpeg or _no_camera_jpeg()
+            last, last_sent = seq, now
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+
+
+_NO_CAMERA_JPEG = None
+
+
+def _no_camera_jpeg():
+    """Small grey picture shown in the live view while there is no camera picture."""
+    global _NO_CAMERA_JPEG
+    if _NO_CAMERA_JPEG is None:
+        img = np.full((240, 320, 3), 45, np.uint8)
+        cv2.putText(img, "NO CAMERA", (70, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 200, 200), 2)
+        _NO_CAMERA_JPEG = cv2.imencode(".jpg", img)[1].tobytes()
+    return _NO_CAMERA_JPEG
 
 
 # --------------------------------------------------------------------------
@@ -1603,6 +1623,8 @@ class DriverLog:
     def ack(self):
         with self.lock:
             at = self.pending_alert_at
+            if at is None:              # nothing to answer (e.g. a double tap): change nothing
+                return None
             self.pending_alert_at = None
             self.pending_level = 0
             for i in range(len(self.events) - 1, -1, -1):
@@ -1661,6 +1683,7 @@ class DriverLog:
         with self.lock:
             if action == "start":
                 self.shift_start, self.last_break = now, now
+                self.rest_until = self.rest_minutes = None     # a new shift never starts "resting"
                 if driver_code is not None:
                     code = _norm_driver_code(driver_code)
                     self.driver_code = code
@@ -1729,6 +1752,8 @@ def _driver_state():
         "rest_until": driver_log.rest_until, "rest_minutes": driver_log.rest_minutes,
         "rest_ringing": driver_log.rest_ringing(),
         "rest_choices": list(REST_CHOICES_MIN),
+        # real company-sync health (the page used to show the phone's own online flag)
+        "sync_ok_at": company_sync.last_ok, "sync_err": company_sync.last_err,
         "events": events[-100:],
     }
 
@@ -1777,17 +1802,17 @@ def _reset_detector_timers():
 
 def _driver_rest(body: dict = Body(...)):
     """{"action": "start", "minutes": 15|30|60} or {"action": "end"} (driver back, drives on)."""
-    action = str(body.get("action", "start"))
+    action = str(body.get("action", ""))
     if action == "end":
         was = driver_log.end_rest()
         if was:
             logger.info("Driver rest ended (driver pressed: drive on)")
         company_sync.wake()
         return {"ok": True, "rest_until": None}
-    try:
-        minutes = int(body.get("minutes", 15))
-    except (TypeError, ValueError):
-        minutes = 15
+    if action != "start":
+        return {"ok": False, "error": "action must be start or end"}
+    m = body.get("minutes")
+    minutes = m if isinstance(m, int) and not isinstance(m, bool) else None
     if minutes not in REST_CHOICES_MIN:
         return {"ok": False, "error": f"minutes must be one of {list(REST_CHOICES_MIN)}"}
     sec = driver_log.ack()                      # pressing rest also answers an open alert
@@ -1827,6 +1852,8 @@ def _nav_state():
 
 
 def _nav_pois(s: float, w: float, n: float, e: float):
+    if not all(math.isfinite(v) for v in (s, w, n, e)):   # nan / inf used to crash (500)
+        return {"pois": []}
     if n - s > 2.0 or e - w > 2.0:                   # zoomed far out: too many to draw
         return {"pois": [], "too_wide": True}
     return {"pois": navigator.pois_in(s, w, n, e)}
@@ -2010,6 +2037,8 @@ class CompanySync:
             "version": APP_VERSION,
             # resting until (epoch s) or None; the company site sends LINE if the rest runs 15 min over
             "rest_until": round(ru) if ru else None,
+            # demo highway drive is on: the company site labels this truck "simulated"
+            "sim": loc.get("source") == "sim",
         }
         cur_code = driver_log.driver_code
         if cur_code:
@@ -2035,8 +2064,12 @@ class CompanySync:
                             logger.info("Cleared company API key per server request")
                     except Exception as ke:
                         logger.warning(f"Failed clearing company API key: {ke}")
+            if self.last_err:
+                logger.info("Company sync OK again")
             self.last_ok, self.last_err = time.time(), None
         except Exception as e:
+            if not self.last_err:                       # log only when it starts failing
+                logger.warning(f"Company sync failing: {e}")
             self.last_err = str(e)
             return
 
@@ -2129,6 +2162,7 @@ def loop():
         if alarm_sound is not None:
             alarm_sound.set_active(driver_log.rest_ringing())   # rest alarm still rings
         live.stats = {"status": "NO_CAMERA", "level": "OK", "level_num": 0, "time": time.time()}
+        live.jpeg = None          # do not keep showing the last face as if the camera still worked
         if time.monotonic() >= next_camera_try:
             open_camera()
         else:
