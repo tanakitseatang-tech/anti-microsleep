@@ -1756,6 +1756,7 @@ def _driver_state():
         "rest_choices": list(REST_CHOICES_MIN),
         # real company-sync health (the page used to show the phone's own online flag)
         "sync_ok_at": company_sync.last_ok, "sync_err": company_sync.last_err,
+        "sync_err_at": company_sync.last_err_at,
         "events": events[-100:],
     }
 
@@ -1898,6 +1899,9 @@ def _nav_sim_drive(body: dict = Body(...)):
         speed = float(body.get("speed", 80.0))
     except (TypeError, ValueError):
         speed = 80.0
+    if not math.isfinite(speed) or speed <= 0:     # nan/inf would also break the JSON reply
+        speed = 80.0
+    speed = max(20.0, min(120.0, speed))
     navigator.start_sim(speed_kmh=speed)
     company_sync.wake()
     return {"ok": True, "active": True, "speed": speed}
@@ -1948,6 +1952,23 @@ def _company_location():
     return {"lat": None, "lon": None, "speed": None}
 
 
+def _boot_id():
+    """Kernel boot id: time.monotonic() values are comparable only within the same boot."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            b = f.read().strip()
+        if b:
+            return b
+    except Exception:
+        pass
+    return "proc-" + secrets.token_hex(8)        # unknown: trust monotonic only within this process
+
+
+BOOT_ID = _boot_id()
+QUEUE_MAX_AGE_S = 7 * 24 * 3600       # events the server keeps refusing are dropped after 7 days
+QUEUE_MAX_SKIPS = 10                  # ... or after this many all-refused send attempts
+
+
 class CompanySync:
     """Background sender: heartbeats + SQLite-queued alert events to company-web."""
 
@@ -1956,6 +1977,7 @@ class CompanySync:
         self.db_lock = threading.Lock()
         self.pending_ack_note = None
         self.last_ok = None
+        self.last_err_at = None
         self.clock_offset = 0.0      # company server time - board time (s), 0 when within a minute
         self.last_err = None
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -1965,14 +1987,40 @@ class CompanySync:
                 "id TEXT PRIMARY KEY, t REAL, level INTEGER, reasons TEXT, "
                 "lat REAL, lon REAL, speed REAL)"
             )
+            # migrate the existing board DB: monotonic time + boot id (robust to clock steps), refusal count
+            for col, typ in (("mono", "REAL"), ("boot", "TEXT"), ("skips", "INTEGER DEFAULT 0")):
+                try:
+                    con.execute(f"ALTER TABLE queue ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+
+    @property
+    def last_err(self):
+        return self._last_err
+
+    @last_err.setter
+    def last_err(self, v):
+        # remember when it failed, so the driver page can tell "failed after the last OK"
+        self._last_err = v
+        if v:
+            self.last_err_at = time.time()
 
     def _db(self):
         return sqlite3.connect(COMPANY_QUEUE_DB, timeout=10.0)
 
+    def _server_time(self, t, mono=None, boot=None):
+        """Best server-clock estimate of a board moment (wall time t, monotonic mono, boot id)."""
+        now_mono = time.monotonic()
+        if mono is not None and boot == BOOT_ID and mono <= now_mono:
+            # same boot: count back from now, immune to NTP stepping the wall clock in between
+            return time.time() + self.clock_offset - (now_mono - mono)
+        return t + self.clock_offset
+
     def enqueue_ack(self, note):
         # (note, press time): the website closes only cases that happened before the press
         with self.db_lock:
-            self.pending_ack_note = (note, time.time())
+            self.pending_ack_note = (note, time.time(), time.monotonic())
         self.wake()
 
     def _read_key(self):
@@ -1999,10 +2047,11 @@ class CompanySync:
             uid = f"{int(time.time()*1000)}-{secrets.token_hex(4)}"
             with self.db_lock, self._db() as con:
                 con.execute(
-                    "INSERT OR IGNORE INTO queue (id, t, level, reasons, lat, lon, speed) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO queue (id, t, level, reasons, lat, lon, speed, mono, boot, skips) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (uid, time.time(), int(level), json.dumps(list(reasons)),
-                     loc.get("lat"), loc.get("lon"), loc.get("speed")),
+                     loc.get("lat"), loc.get("lon"), loc.get("speed"),
+                     time.monotonic(), BOOT_ID),
                 )
             self.wake()
         except Exception as e:
@@ -2039,7 +2088,7 @@ class CompanySync:
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
             # resting until (epoch s) or None; the company site sends LINE if the rest runs 15 min over
-            "rest_until": round(ru) if ru else None,
+            "rest_until": round(ru + self.clock_offset) if ru else None,
             # demo highway drive is on: the company site labels this truck "simulated"
             "sim": loc.get("source") == "sim",
         }
@@ -2087,23 +2136,42 @@ class CompanySync:
 
         with self.db_lock, self._db() as con:
             rows = con.execute(
-                "SELECT id, t, level, reasons, lat, lon, speed FROM queue ORDER BY t ASC LIMIT 50"
+                "SELECT id, t, level, reasons, lat, lon, speed, mono, boot, skips "
+                "FROM queue ORDER BY t ASC LIMIT 50"
             ).fetchall()
         if rows:
-            events = [
-                {
-                    "id": r[0], "t": round(r[1] + self.clock_offset), "level": r[2],
+            srv_now = time.time() + self.clock_offset
+            events, ages = [], {}
+            for r in rows:
+                t_srv = self._server_time(r[1], r[7], r[8])
+                ages[r[0]] = srv_now - t_srv
+                events.append({
+                    "id": r[0], "t": round(t_srv), "level": r[2],
                     "reasons": json.loads(r[3] or "[]"),
                     "lat": r[4], "lon": r[5], "speed": r[6],
                     **({"driver": cur_code} if cur_code else {}),
-                }
-                for r in rows
-            ]
+                })
             try:
-                self._post(f"{base}/api/ingest/event", key, {"events": events})
-                with self.db_lock, self._db() as con:
-                    con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
-                logger.info(f"Synced {len(rows)} alert event(s) to company server")
+                resp = self._post(f"{base}/api/ingest/event", key, {"events": events})
+                saved = resp.get("saved") if isinstance(resp, dict) else None
+                skipped = resp.get("skipped") if isinstance(resp, dict) else None
+                if saved == 0 and skipped == len(rows):
+                    # The server refused every event (e.g. its time is out of range, or all were
+                    # already saved earlier). Keep them for a retry, but drop rows that are older
+                    # than 7 days or keep being refused, so the queue can never get stuck.
+                    drop = [(r[0],) for r in rows
+                            if ages[r[0]] > QUEUE_MAX_AGE_S or (r[9] or 0) + 1 >= QUEUE_MAX_SKIPS]
+                    with self.db_lock, self._db() as con:
+                        con.executemany("UPDATE queue SET skips = COALESCE(skips, 0) + 1 WHERE id = ?",
+                                        [(r[0],) for r in rows])
+                        con.executemany("DELETE FROM queue WHERE id = ?", drop)
+                    logger.warning(f"Company server skipped all {len(rows)} queued event(s); "
+                                   f"kept {len(rows) - len(drop)}, dropped {len(drop)}")
+                else:
+                    with self.db_lock, self._db() as con:
+                        con.executemany("DELETE FROM queue WHERE id = ?", [(r[0],) for r in rows])
+                    logger.info(f"Synced {len(rows)} alert event(s) to company server"
+                                + (f" (saved {saved}, skipped {skipped})" if skipped else ""))
             except Exception as e:
                 self.last_err = str(e)
                 return
@@ -2111,9 +2179,10 @@ class CompanySync:
         with self.db_lock:
             ack = self.pending_ack_note
         if ack:
-            ack_note, ack_t = ack
+            ack_note, ack_t, ack_mono = ack
             try:
-                self._post(f"{base}/api/ingest/ack", key, {"note": ack_note, "t": round(ack_t + self.clock_offset)})
+                self._post(f"{base}/api/ingest/ack", key,
+                           {"note": ack_note, "t": round(self._server_time(ack_t, ack_mono, BOOT_ID))})
                 with self.db_lock:
                     if self.pending_ack_note is ack:
                         self.pending_ack_note = None

@@ -321,33 +321,48 @@ class Navigator:
             self.gps = g
             self._save_last_gps(g)
 
-    def start_sim(self, speed_kmh=80.0):
-        """Start driving along a real Thai highway (Bang Na -> Chonburi) for indoor demos."""
-        speed = max(20.0, min(120.0, float(speed_kmh or 80.0)))
-        start_pt, end_pt = (13.6682, 100.6340), (13.3611, 100.9847)
-        pts = None
+    # Offline fallback waypoints along Bang Na-Trad / Highway 34 -> Chonburi
+    SIM_FALLBACK_PTS = [
+        (13.6682, 100.6340), (13.6572, 100.6780), (13.6408, 100.7155),
+        (13.6115, 100.7580), (13.5880, 100.8120), (13.5685, 100.8750),
+        (13.5320, 100.9280), (13.4850, 100.9680), (13.4220, 100.9860),
+        (13.3611, 100.9847),
+    ]
+
+    def _fetch_sim_route(self):
+        """Real road geometry for the demo drive (local OSRM, then public OSRM). Short timeouts."""
+        start_pt, end_pt = self.SIM_FALLBACK_PTS[0], self.SIM_FALLBACK_PTS[-1]
         coords = f"{start_pt[1]:.6f},{start_pt[0]:.6f};{end_pt[1]:.6f},{end_pt[0]:.6f}"
-        for base in (self.osrm, "https://router.project-osrm.org"):
+        for base, tmo in ((self.osrm, 1.5), ("https://router.project-osrm.org", 3.0)):
             try:
                 u = f"{base}/route/v1/driving/{coords}?overview=full&geometries=geojson"
-                with urllib.request.urlopen(u, timeout=4.0) as r:
+                with urllib.request.urlopen(u, timeout=tmo) as r:
                     d = json.load(r)
                 if d.get("code") == "Ok" and d.get("routes"):
                     pts = [(c[1], c[0]) for c in d["routes"][0]["geometry"]["coordinates"]]
                     if len(pts) >= 2:
-                        break
+                        return pts
             except Exception:
                 continue
-        if not pts or len(pts) < 2:
-            # Offline fallback waypoints along Bang Na-Trad / Highway 34 -> Chonburi
-            pts = [
-                (13.6682, 100.6340), (13.6572, 100.6780), (13.6408, 100.7155),
-                (13.6115, 100.7580), (13.5880, 100.8120), (13.5685, 100.8750),
-                (13.5320, 100.9280), (13.4850, 100.9680), (13.4220, 100.9860),
-                (13.3611, 100.9847),
-            ]
+        return None
+
+    def start_sim(self, speed_kmh=80.0):
+        """Start driving along a real Thai highway (Bang Na -> Chonburi) for indoor demos.
+        Returns at once: starts on the cached road route (or fallback waypoints) and upgrades
+        to the real road geometry in a background thread, so the web request never times out."""
+        try:
+            speed = float(speed_kmh)
+        except (TypeError, ValueError):
+            speed = 80.0
+        if not math.isfinite(speed) or speed <= 0:          # nan/inf must never reach the simulator
+            speed = 80.0
+        speed = max(20.0, min(120.0, speed))
+        cached = getattr(self, "_sim_road_pts", None)
+        pts = list(cached) if cached else list(self.SIM_FALLBACK_PTS)
         course = bearing_deg(pts[0][0], pts[0][1], pts[1][0], pts[1][1])
+        gen = getattr(self, "_sim_gen", 0) + 1
         with self.lock:
+            self._sim_gen = gen
             self._sim = {
                 "active": True, "pts": pts, "seg": 0, "dist": 0.0,
                 "speed_kmh": speed, "t": time.monotonic(),
@@ -355,8 +370,27 @@ class Navigator:
                 "name": "บางนา-ตราด → ชลบุรี (จำลอง)",
             }
             self._last_at = None
+        if not cached:
+            threading.Thread(target=self._upgrade_sim_route, args=(gen,), daemon=True).start()
         self.log.info(f"Demo drive simulator started ({len(pts)} road points, {speed:.0f} km/h)")
         return True
+
+    def _upgrade_sim_route(self, gen):
+        """Background: swap the fallback waypoints for the real road route, keeping the distance driven."""
+        road = self._fetch_sim_route()
+        if not road:
+            return
+        self._sim_road_pts = road
+        with self.lock:
+            s = self._sim
+            if getattr(self, "_sim_gen", 0) != gen or not s.get("active"):
+                return
+            old = s["pts"]
+            driven = s["dist"] + sum(
+                haversine_m(old[i][0], old[i][1], old[i + 1][0], old[i + 1][1]) for i in range(min(s["seg"], len(old) - 1))
+            )
+            s["pts"], s["seg"], s["dist"] = road, 0, driven      # _step_sim walks forward to the right segment
+        self.log.info(f"Demo drive switched to the real road route ({len(road)} points)")
 
     def stop_sim(self):
         with self.lock:
