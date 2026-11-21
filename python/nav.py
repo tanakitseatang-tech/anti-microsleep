@@ -152,8 +152,13 @@ class Navigator:
         try:
             with open(self.last_gps_file) as f:
                 d = json.load(f)
+            # keep the real time of that fix (not "now"), so after a reboot an old position is
+            # known to be old and is not sent to the company as if it were live
+            t = d.get("t")
+            if not isinstance(t, (int, float)):
+                t = os.path.getmtime(self.last_gps_file)
             return {
-                "state": 1, "t": time.time(), "sats": int(d.get("sats", 6)), "hdop": 1.5,
+                "state": 1, "t": float(t), "sats": int(d.get("sats", 6)), "hdop": 1.5,
                 "lat": float(d["lat"]), "lon": float(d["lon"]),
                 "speed": 0.0, "course": d.get("course"), "indoor_hold": True,
             }
@@ -316,8 +321,11 @@ class Navigator:
         }
         if gps_state == 1 and (fresh or last_fix):
             src = g if (fresh and g.get("lat") is not None) else last_fix
+            # stale = last known position older than the hold time (e.g. saved before a reboot):
+            # still shown on the driver's map, but not reported to the company as live
+            stale = src is last_fix and time.time() - last_fix.get("t", 0) >= GPS_FIX_HOLD_S
             return {**base, "lat": src["lat"], "lon": src["lon"], "speed": src.get("speed", 0.0),
-                    "course": src.get("course"), "source": "gps"}
+                    "course": src.get("course"), "source": "gps", "stale": stale}
         if test:
             return {**base, "lat": test[0], "lon": test[1], "speed": None, "course": test[2], "source": "test"}
         return {**base, "lat": None, "lon": None, "source": "none"}

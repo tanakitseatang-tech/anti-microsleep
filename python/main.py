@@ -160,6 +160,7 @@ NO_DRIVER_REPORT_S = 60.0
 # driver sits in front of the camera or presses "ขับต่อ", for at most REST_ALARM_MAX_S.
 # (Board off = engine off: no ring; the company website sends LINE if the rest runs 15 min over.)
 REST_CHOICES_MIN = (15, 30, 60)
+CAMERA_NONE_REOPEN_S = 3.0      # camera returns no frames this long -> close and reopen it
 REST_ALARM_MAX_S = 10 * 60
 REST_AWAKE_S = 3.0             # face seen with eyes open this long after the rest = driver is back
 REST_CANCEL_KMH = 15.0          # a live GPS fix this fast during a rest = driving -> rest cancelled
@@ -1895,6 +1896,16 @@ def _host_network():
     return {}
 
 
+def _company_location():
+    """Position for the company website: only a real satellite fix (live or recently held).
+    Never the indoor test location or an old fix saved before a reboot (the website then keeps
+    showing the last real position with its time)."""
+    loc = navigator.location()
+    if loc.get("source") == "gps" and not loc.get("stale"):
+        return loc
+    return {"lat": None, "lon": None, "speed": None}
+
+
 class CompanySync:
     """Background sender: heartbeats + SQLite-queued alert events to company-web."""
 
@@ -1939,7 +1950,7 @@ class CompanySync:
         return COMPANY_URL_DEFAULT
 
     def enqueue(self, level, reasons):
-        loc = navigator.location()
+        loc = _company_location()
         uid = f"{int(time.time()*1000)}-{secrets.token_hex(4)}"
         with self.db_lock, self._db() as con:
             con.execute(
@@ -1969,7 +1980,7 @@ class CompanySync:
     def _step(self):
         key = self._read_key()
         base = self._read_url()
-        loc = navigator.location()
+        loc = _company_location()
         st = live.stats
         hb = {
             "lat": loc.get("lat"),
@@ -2048,6 +2059,7 @@ def open_camera():
         cam = Camera(CAMERA_SOURCE, resolution=RESOLUTION, fps=FPS)
         cam.start()
         camera = cam
+        loop._had_frame, loop._none_since = False, None
         logger.info(f"Camera started: {CAMERA_SOURCE or 'auto'} {RESOLUTION}@{FPS}")
     except Exception as e:
         camera = None
@@ -2086,8 +2098,27 @@ def loop():
         camera = None
         return
     if frame is None:
+        # A USB drop-out (error -71) can make capture() return nothing forever without raising:
+        # after CAMERA_NONE_REOPEN_S of empty frames, close the camera so open_camera() retries.
+        # (a just-opened camera gets 10 s to deliver its first frame)
+        now_m = time.monotonic()
+        limit = CAMERA_NONE_REOPEN_S if getattr(loop, "_had_frame", False) else 10.0
+        if getattr(loop, "_none_since", None) is None:
+            loop._none_since = now_m
+        elif now_m - loop._none_since >= limit:
+            logger.warning(f"Camera gave no frames for {limit:.0f}s; reopening")
+            loop._none_since = None
+            loop._had_frame = False
+            try:
+                camera.stop()
+            except Exception:
+                pass
+            camera = None
+            return
         time.sleep(0.01)
         return
+    loop._none_since = None
+    loop._had_frame = True
     if frame.ndim == 2:
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
