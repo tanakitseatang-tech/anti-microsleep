@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anti-Microsleep · แหล่งที่มา &amp; ความเป็นส่วนตัว</title>
+<style>
+  body { margin: 0; padding: 16px; background: #0b1220; color: #e5e7eb; font: 16px/1.6 system-ui, "Noto Sans Thai", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 4px 0 4px; } h2 { font-size: 18px; margin: 22px 0 6px; color: #93c5fd; }
+  .sub { color: #94a3b8; margin: 0 0 12px; }
+  a { color: #93c5fd; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  td { border-top: 1px solid #1f2937; padding: 7px 6px; vertical-align: top; }
+  td:first-child { font-weight: 700; width: 42%; }
+  .box { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 12px 14px; }
+  .back { display: inline-block; margin-bottom: 10px; padding: 8px 14px; border-radius: 10px; background: #1d4ed8; color: #fff; text-decoration: none; font-weight: 700; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="/driver.html">← กลับหน้าคนขับ</a>
+  <h1>📜 แหล่งที่มา &amp; ความเป็นส่วนตัว</h1>
+  <p class="sub">Anti-Microsleep Team · ระบบตรวจจับการหลับในบน <b>Arduino UNO Q</b> (AI ประมวลผลบนบอร์ดในรถ)</p>
+
+  <h2>🔒 ความเป็นส่วนตัว (PDPA)</h2>
+  <div class="box">
+    <ul>
+      <li>ภาพจากกล้องประมวลผล <b>บนบอร์ดในรถเท่านั้น</b> ไม่บันทึกวิดีโอ และไม่ส่งภาพขึ้นอินเทอร์เน็ต</li>
+      <li>ส่งให้บริษัทเฉพาะ <b>เหตุการณ์แจ้งเตือน</b> (เวลา ระดับ สาเหตุ ตำแหน่ง ความเร็ว รหัสคนขับ)</li>
+      <li>ประวัติแจ้งเตือนบนเว็บบริษัทลบอัตโนมัติเมื่อครบ 90 วัน</li>
+      <li>ภาพตาที่ใช้วิจัยแยก "หรี่ตา/หลับตา" ถูกลบหมดแล้ว เหลือเฉพาะตัวเลขค่าวัดที่ระบุตัวตนไม่ได้</li>
+    </ul>
+  </div>
+
+  <h2>🤖 โมเดล AI &amp; คอมพิวเตอร์วิทัศน์</h2>
+  <table>
+    <tr><td>MediaPipe Face Landmarker + Face Blendshapes</td><td>Google · Apache-2.0 — จุดบนใบหน้า 478 จุด รันบนบอร์ดด้วย LiteRT</td></tr>
+    <tr><td>ai-edge-litert</td><td>Google AI Edge · Apache-2.0 — ตัวรันโมเดลบนบอร์ด</td></tr>
+    <tr><td>OpenCV + haarcascade_eye_tree_eyeglasses</td><td>OpenCV · Apache-2.0 — ประมวลผลภาพ / ตรวจตาเมื่อใส่แว่น</td></tr>
+    <tr><td>Arduino App Lab (web_ui, object_detection)</td><td>Arduino — ระบบแอปบน UNO Q</td></tr>
+  </table>
+
+  <h2>🗺️ แผนที่ &amp; เส้นทาง</h2>
+  <table>
+    <tr><td>ข้อมูลแผนที่ &amp; จุดพัก/ปั๊ม</td><td>© OpenStreetMap contributors · ODbL (ไฟล์จาก Geofabrik)</td></tr>
+    <tr><td>OSRM</td><td>Project OSRM · BSD-2 — คำนวณเส้นทางบนบอร์ด</td></tr>
+    <tr><td>Leaflet</td><td>BSD-2 — แสดงแผนที่</td></tr>
+    <tr><td>Protomaps (pmtiles, protomaps-leaflet)</td><td>BSD-3 — แผนที่ออฟไลน์</td></tr>
+  </table>
+
+  <h2>🔊 เสียง</h2>
+  <table>
+    <tr><td>เสียงพูดภาษาไทย (learning / ready)</td><td>Microsoft Neural TTS (th-TH-Premwadee)</td></tr>
+    <tr><td>เสียงเตือน beep.wav</td><td>จัดหาโดยทีม (รอยืนยันแหล่งที่มา)</td></tr>
+  </table>
+
+  <h2>🧰 ซอฟต์แวร์ &amp; บริการ</h2>
+  <table>
+    <tr><td>Arduino Core, RouterBridge, LED_Matrix</td><td>Arduino — เฟิร์มแวร์ STM32 บน UNO Q</td></tr>
+    <tr><td>Next.js, React, postgres.js, bcryptjs, jose</td><td>MIT / Unlicense — เว็บบริษัท</td></tr>
+    <tr><td>Vercel, Supabase, LINE Messaging API</td><td>โฮสติ้ง ฐานข้อมูล และแจ้งเตือน</td></tr>
+  </table>
+
+  <h2>🤝 ผู้ช่วย AI ในการพัฒนา</h2>
+  <table>
+    <tr><td>Claude (Anthropic)</td><td>ช่วยดีบัก ปรับ UI เอกสาร และสคริปต์ทดสอบ</td></tr>
+    <tr><td>Antigravity / Gemini (Google)</td><td>ช่วยออกแบบเคส 3D ตั้งค่าเครือข่าย/QR และตรวจโค้ด</td></tr>
+  </table>
+  <p class="sub" style="margin-top:14px">การออกแบบระบบ การต่อฮาร์ดแวร์ การทดสอบกับคนจริง และการตัดสินใจทางวิศวกรรม ทำโดยทีม Anti-Microsleep</p>
+</main>
+</body>
+</html>

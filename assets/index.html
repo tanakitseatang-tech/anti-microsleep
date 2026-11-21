@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Anti Microsleep Live</title>
+<title>Anti-Microsleep Live</title>
 <style>
   :root {
     --bg: #0f1216; --panel: #181c22; --line: #262c35; --text: #e7eaee; --muted: #8b95a3;
@@ -59,12 +59,14 @@
   .back .arr { font-size: 20px; line-height: 1; }
   #login .back { align-self: center; margin-top: 6px; }
   body.embedded .back, body.embedded header nav { display: none; }
+  body.embedded #logout { display: none; }          /* no accidental logout on the presenter screen */
+  .video.off { border-color: #6b7280 !important; }   /* no camera / resting: grey, not green */
 </style>
 </head>
 <body>
 <div id="login">
   <form id="loginForm">
-    <h2>🔒 ANTI MICROSLEEP · Live</h2>
+    <h2>🔒 Anti-Microsleep · ภาพสด</h2>
     <div class="sub">หน้านี้แสดงภาพหน้าคนขับ ต้องใส่รหัสผ่านก่อน</div>
     <input class="txt" id="loginPw" type="password" autocomplete="current-password" placeholder="รหัสผ่าน" required>
     <button type="submit" id="loginBtn">เข้าสู่ระบบ</button>
@@ -75,11 +77,11 @@
 <header>
   <a class="back" href="/driver.html" title="กลับหน้าแผนที่คนขับ"><span class="arr">←</span> กลับแผนที่</a>
   <span class="dot" id="dot"></span>
-  <h1>ANTI MICROSLEEP · Live</h1>
+  <h1>Anti-Microsleep · ภาพสด</h1>
   <nav style="display:flex; gap:12px; margin-left:14px; font-size:13px">
-    <a href="/driver.html" style="color:var(--accent); text-decoration:none; font-weight:600">🗺️ หน้าคนขับ</a>
     <a href="/both.html" style="color:var(--accent); text-decoration:none; font-weight:600">🖥️ จอคู่</a>
     <a href="https://antimicrosleep-head.vercel.app" target="_blank" rel="noopener" style="color:var(--accent); text-decoration:none; font-weight:600">🏢 เว็บบริษัท</a>
+    <a href="/credits.html" style="color:var(--accent); text-decoration:none; font-weight:600">📜 แหล่งที่มา</a>
   </nav>
   <span class="conn" id="conn">กำลังเชื่อมต่อ…</span>
   <button id="logout">ออกจากระบบ</button>
@@ -125,7 +127,7 @@
       <div><div class="k">AI สถานะ</div><div class="v" id="aiStatus">—</div></div>
     </div>
     <button id="recal">รีเซ็ต (ล้าง PERCLOS + เรียนรู้ตาใหม่)</button>
-    <div class="card">
+    <div class="card" id="rfCard">
       <h2>Roboflow API key</h2>
       <div style="display:flex; gap:8px">
         <input id="rfKey" type="password" autocomplete="off" placeholder="วาง API key ที่นี่"
@@ -151,7 +153,29 @@ if (window.top !== window.self) document.body.classList.add("embedded");
 const $ = id => document.getElementById(id);
 const LEVEL_TH = ["ปกติ", "เตือน", "อันตราย!"];
 const STATUS_TH = { OK: "เจอใบหน้า ทำงานปกติ", CALIBRATING: "กำลังปรับเกณฑ์… มองกล้อง ลืมตาปกติ",
-  NO_CAMERA: "ไม่พบกล้อง", NO_FACE: "ไม่เห็นใบหน้า", LOW_LIGHT: "มืดเกินไปสำหรับกล้อง" };
+  NO_CAMERA: "ไม่พบกล้อง", NO_FACE: "ไม่เห็นใบหน้า", LOW_LIGHT: "มืดเกินไปสำหรับกล้อง",
+  RESTING: "กำลังพักรถ (หยุดตรวจจับ)" };
+// detector reasons in Thai (same wording as the driver page)
+const TH = [
+  [/^microsleep ([\d.]+)s/, (m) => `หลับใน ${m[1]} วินาที`],
+  [/^eyes closed (\d+)% of last 2s/, (m) => `หลับตาต่อเนื่อง (${m[1]}% ใน 2 วิ)`],
+  [/^eyes closed ([\d.]+)s/, (m) => `หลับตา ${m[1]} วินาที`],
+  [/^PERCLOS (\d+)%( \(very drowsy\))?/, (m) => m[2] ? `ง่วงมาก (PERCLOS ${m[1]}%)` : `เริ่มง่วง (PERCLOS ${m[1]}%)`],
+  [/^(\d+) yawns/, (m) => `หาว ${m[1]} ครั้งใน 5 นาที`],
+  [/^face not visible/, () => "มองไม่เห็นใบหน้า"],
+  [/^driver not visible (\d+)s/, (m) => `มองไม่เห็นคนขับ ${m[1]} วินาที`],
+  [/^head dropped, face hidden (\d+)s/, (m) => `หัวตก ไม่เห็นหน้า ${m[1]} วินาที`],
+  [/^head dropped (\d+)s/, (m) => `หัวตก ${m[1]} วินาที`],
+  [/^heavy eyelids (\d+)s/, (m) => `ตาหนัก/หรี่ตานาน ${m[1]} วินาที`],
+  [/^head down \+ eyes closed/, () => "ก้มหัว + หลับตา"],
+  [/^head back \+ eyes closed/, () => "หัวเอนหลัง + หลับตา"],
+  [/^head tilted \+ eyes closed/, () => "เอียงหัว + หลับตา"],
+  [/^head down (\d+)s/, (m) => `ก้มหัว ${m[1]} วินาที`],
+  [/^head back (\d+)s/, (m) => `หัวเอนหลัง ${m[1]} วินาที`],
+  [/^head tilted (\d+)s/, (m) => `เอียงหัว ${m[1]} วินาที`],
+  [/^looking away (\d+)s/, (m) => `ไม่มองถนน ${m[1]} วินาที`],
+];
+const th = (r) => { r = String(r); for (const [re, f] of TH) { const m = r.match(re); if (m) return f(m); } return r; };
 const hist = [];      // [time, ear, thr]
 let lastOk = 0, wasOn = true, authed = false;
 
@@ -195,30 +219,38 @@ $("logout").onclick = async () => {
 const fmt = (v, d = 3) => v == null ? "—" : Number(v).toFixed(d);
 
 async function poll() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1500);
   try {
-    const r = await fetch("api/stats", { cache: "no-store" });
+    const r = await fetch("api/stats", { cache: "no-store", signal: ctrl.signal });
     if (r.status === 401) { if (authed || $("login").style.display !== "grid") showLogin(); throw 0; }
+    if (!r.ok) throw 0;                      // an error page is not "logged in"
     if (!authed) startLive();
     const s = await r.json();
     lastOk = Date.now();
     render(s);
   } catch (e) { /* offline */ }
+  finally { clearTimeout(timer); }
   const on = Date.now() - lastOk < 2000;
   if (on && !wasOn && authed) feed.src = "stream?" + Date.now();   // board came back: reconnect video
   wasOn = on;
   $("dot").classList.toggle("on", on);
   $("conn").textContent = on ? "เชื่อมต่อแล้ว" : "ขาดการเชื่อมต่อ";
-  setTimeout(poll, 250);
+  setTimeout(poll, authed ? 250 : 1000);     // no fast polling on the login screen
 }
 
 function render(s) {
   const lv = s.level_num ?? 0;
-  $("level").textContent = LEVEL_TH[lv]; $("level").className = "level l" + lv;
-  $("video").className = "video l" + lv;
-  $("banner").textContent = LEVEL_TH[lv] + (s.status && s.status !== "OK" ? " · " + s.status : "");
-  $("banner").style.color = ["var(--ok)", "var(--warn)", "var(--alarm)"][lv];
+  // no camera / resting: grey "not watching", never a green "ปกติ"
+  const idle = s.status === "NO_CAMERA" || s.status === "RESTING";
+  $("level").textContent = idle ? (STATUS_TH[s.status]) : LEVEL_TH[lv];
+  $("level").className = "level " + (idle ? "" : "l" + lv);
+  $("video").className = "video " + (idle ? "off" : "l" + lv);
+  $("banner").textContent = idle ? STATUS_TH[s.status]
+    : LEVEL_TH[lv] + (s.status && s.status !== "OK" ? " · " + (STATUS_TH[s.status] || s.status) : "");
+  $("banner").style.color = idle ? "#9ca3af" : ["var(--ok)", "var(--warn)", "var(--alarm)"][lv];
   $("status").textContent = STATUS_TH[s.status] || s.status || "—";
-  $("reasons").textContent = (s.reasons || []).join(" · ");
+  $("reasons").textContent = (s.reasons || []).map(th).join(" · ");
 
   const thr = s.ear_threshold;
   $("ear").textContent = fmt(s.ear);
@@ -251,7 +283,7 @@ function render(s) {
   $("fps").textContent = fmt(s.fps, 1);
   $("yaw").textContent = s.yaw == null ? "—" : (s.looking_away ? "หันออก " : "ตรง ") + "(" + s.yaw.toFixed(2) + ")";
   $("yaw").style.color = s.looking_away ? "var(--warn)" : "";
-  $("cal").textContent = s.calibrated ? "เรียนรู้แล้ว" : "กำลังเรียนรู้…";
+  $("cal").textContent = idle ? "—" : s.calibrated ? "เรียนรู้แล้ว" : "กำลังเรียนรู้…";
   const pd = s.pitch_delta, rd = s.roll_delta;
   $("head").textContent = rd == null ? "—"
     : (s.head_down ? "ก้ม! " : s.head_back ? "เอนหลัง! " : s.head_tilt ? "เอียง! " : "ปกติ ")
@@ -264,6 +296,12 @@ function render(s) {
   const st = s.ai_status || "—";
   $("aiStatus").textContent = st === "ok" ? `ทำงาน · ${Math.round((s.ai_latency || 0) * 1000)} ms · ${s.ai_calls} ครั้ง`
     : st.startsWith("off") ? "ปิด (ไม่มี API key)" : st === "offline" ? "ออฟไลน์ (ใช้ EAR อย่างเดียว)" : st;
+  // Roboflow (cloud AI) is switched off on purpose: hide its rows and key box instead of
+  // showing what looks like a broken feature
+  const rfOff = !s.ai_status || st.startsWith("off");
+  $("ai").parentElement.style.display = rfOff ? "none" : "";
+  $("aiStatus").parentElement.style.display = rfOff ? "none" : "";
+  $("rfCard").style.display = rfOff ? "none" : "";
 
   const now = Date.now() / 1000;
   hist.push([now, s.ear, thr]);
@@ -291,6 +329,7 @@ function drawChart(now) {
 }
 
 $("recal").onclick = async () => {
+  if (!confirm("รีเซ็ตจริงไหม? ระบบจะล้างค่า PERCLOS และเริ่มเรียนรู้ตาคนขับใหม่")) return;
   $("recal").disabled = true;
   try { await fetch("api/recalibrate", { method: "POST" }); } catch (e) {}
   setTimeout(() => $("recal").disabled = false, 2000);

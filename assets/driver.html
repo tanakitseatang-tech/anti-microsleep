@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d1014">
-<title>Anti Microsleep · คนขับ</title>
+<title>Anti-Microsleep · คนขับ</title>
 <link rel="stylesheet" href="vendor/leaflet.css">
 <style>
   :root {
@@ -211,7 +211,7 @@
 <header class="bar">
   <button class="icon-btn" id="menuBtn" aria-label="เมนู" aria-controls="drawer" aria-expanded="false">☰</button>
   <div class="brand">
-    <b id="title">Anti Microsleep</b>
+    <b id="title">Anti-Microsleep</b>
     <small><span class="dot" id="dot"></span><span id="conn">กำลังเชื่อมต่อ…</span></small>
   </div>
   <div class="grow"></div>
@@ -337,6 +337,7 @@
     <a href="/" target="_top"><span class="ico">📷</span>ภาพสด (ช่าง)</a>
     <a href="/both.html" target="_top"><span class="ico">🖥️</span>ภาพสด + แผนที่</a>
     <a href="https://antimicrosleep-head.vercel.app" target="_blank" rel="noopener"><span class="ico">🏢</span>เว็บบริษัท<span class="ext">↗</span></a>
+    <a href="/credits.html" target="_top"><span class="ico">📜</span>แหล่งที่มา &amp; ความเป็นส่วนตัว</a>
   </div>
   <div class="label">แผนที่</div>
   <div class="nav">
@@ -344,7 +345,7 @@
     <button id="menuFull"><span class="ico">⛶</span>แผนที่เต็มจอ</button>
     <button id="simDriveBtn"><span class="ico">🚗</span><span id="simDriveTxt">จำลองขับรถ 80 กม./ชม.</span></button>
   </div>
-  <div class="foot">Anti-Microsleep Team</div>
+  <div class="foot">Anti-Microsleep Team · ขับเคลื่อนด้วย Arduino UNO Q (AI บนบอร์ด)</div>
 </nav>
 
 <script src="vendor/leaflet.js"></script>
@@ -658,7 +659,9 @@ const TH = [
   [/^heavy eyelids (\d+)s/, () => "ตาหนัก ลืมตาไม่ขึ้น"],
   [/^head down \+ eyes closed/, () => "ก้มหัว + หลับตา"],
   [/^head tilted \+ eyes closed/, () => "เอียงหัว + หลับตา"],
+  [/^head back \+ eyes closed/, () => "หัวเอนหลัง + หลับตา"],
   [/^head down (\d+)s/, (m) => `ก้มหัว ${m[1]} วินาที`],
+  [/^head back (\d+)s/, (m) => `หัวเอนหลัง ${m[1]} วินาที`],
   [/^head tilted (\d+)s/, (m) => `เอียงหัว ${m[1]} วินาที`],
   [/^looking away (\d+)s/, (m) => `ไม่มองถนน ${m[1]} วินาที`],
 ];
@@ -722,9 +725,10 @@ function render() {
   const drvTag = activeCode ? (activeName ? `${activeCode} ${activeName}` : `รหัส ${activeCode}`) : "";
   $("title").textContent = `รถคันที่ ${d.truck}${drvTag ? " · " + drvTag : ""}`;
   updateDriverPreview();
-  const online = navigator.onLine;
-  $("syncTxt").textContent = online ? "ซิงก์บริษัทแล้ว" : "ออฟไลน์ (เก็บในคิว)";
-  $("syncPill").className = "chip " + (online ? "good" : "warn");
+  // real company-sync state from the board (not the phone's own "online" flag)
+  const synced = d.sync_ok_at != null && d.now - d.sync_ok_at < 30;
+  $("syncTxt").textContent = synced ? "ซิงก์บริษัทแล้ว" : "ยังส่งบริษัทไม่ได้ (เก็บในคิว)";
+  $("syncPill").className = "chip " + (synced ? "good" : "warn");
   $("syncPill").title = $("syncTxt").textContent;
 
   let icon, big, why;
@@ -736,7 +740,8 @@ function render() {
   $("flash").className = d.level ? "l" + d.level : "";
 
   // alert acknowledgement (always on top) or the rest countdown
-  const needAck = !!d.pending_alert_at || d.level > 0;
+  // only an unanswered alert needs a tap (a lingering yellow level no longer brings the card back)
+  const needAck = !!d.pending_alert_at;
   const ackRed = d.level === 2 || d.pending_level === 2;
   const resting = !!d.rest_until;
   $("restPickBox").hidden = !restPickOpen;
@@ -755,7 +760,9 @@ function render() {
     $("restTitle").textContent = rem >= 0
       ? `☕ กำลังพักรถ ${d.rest_minutes || ""} นาที · ระบบหยุดตรวจจับ`
       : d.rest_ringing
-        ? "🔔 หมดเวลาพักแล้ว! ลืมตามองกล้อง 3 วินาที หรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก"
+        ? (d.status === "NO_CAMERA"
+            ? "🔔 หมดเวลาพักแล้ว! กด \"ขับต่อ\" เพื่อหยุดเสียงปลุก (ไม่พบกล้อง)"
+            : "🔔 หมดเวลาพักแล้ว! ลืมตามองกล้อง 3 วินาที หรือกด \"ขับต่อ\" เพื่อหยุดเสียงปลุก")
         : "⏰ หมดเวลาพักแล้ว! (เกิน 15 นาทีบริษัทจะได้รับแจ้ง)";
     $("restAlarmTime").textContent = hhmm(d.rest_until);
     $("restAlarmTxt").hidden = rem < 0;
@@ -798,19 +805,37 @@ function render() {
 }
 
 async function pollOnce() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3000);   // a hung request must not freeze the loop
   try {
-    const r = await fetch("/api/driver", { cache: "no-store" });
+    const r = await fetch("/api/driver", { cache: "no-store", signal: ctrl.signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
     state = await r.json(); lastOk = Date.now(); render();
-  } catch (e) {}
+  } catch (e) {
+  } finally { clearTimeout(timer); }
 }
 async function pollDriver() {
   await pollOnce();
   const alive = Date.now() - lastOk < 4000;
   $("dot").classList.toggle("on", alive);
   $("conn").textContent = alive ? "เชื่อมต่อบอร์ดแล้ว" : "เชื่อมต่อบอร์ดไม่ได้";
-  if (!alive && !state) { $("big").textContent = "เชื่อมต่อบอร์ดไม่ได้"; $("why").textContent = "ตรวจว่าเปิดฮอตสปอต AMS อยู่"; }
+  if (!alive) {
+    // board unreachable: stop showing old state (e.g. a red flash) as if it were live
+    $("flash").className = "";
+    $("status").className = "status off";
+    $("status").style.visibility = "";
+    $("icon").textContent = "📡"; $("big").textContent = "เชื่อมต่อบอร์ดไม่ได้";
+    $("why").textContent = "ตรวจว่ามือถือต่อฮอตสปอต/Wi-Fi เดียวกับบอร์ด";
+  }
   setTimeout(pollDriver, 1000);
 }
+// keep the phone screen on while this page is open (Chrome/Android; needs one tap first)
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request("screen"); wakeLock.addEventListener("release", () => { wakeLock = null; }); } } catch (e) {}
+}
+document.addEventListener("pointerdown", keepAwake);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) keepAwake(); });
 async function post(url, body) {
   try { await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); } catch (e) {}
 }
