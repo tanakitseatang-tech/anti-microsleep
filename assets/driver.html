@@ -124,6 +124,9 @@
               border-radius: 3px; background: var(--line); }
     .panel-head { padding-top: 14px; cursor: pointer; touch-action: none; }
     body:not(.sheet-open) .more { display: none; }
+    /* no shift running: show the 3-digit check-in card even while the sheet is small */
+    body.no-shift:not(.sheet-open) .more { display: block; }
+    body.no-shift:not(.sheet-open) .more > .card:not(:first-child) { display: none; }
     body.panel-hidden .panel { transform: translateY(110%); }
     #expandBtn .up { display: inline; } #expandBtn .down { display: none; }
     .dock { right: 72px; }                 /* keep the map buttons on the right free */
@@ -145,6 +148,10 @@
     body.panel-hidden #map, body.panel-hidden .maparea { left: 0; }
     #expandBtn { display: none; }
     .panel-head { padding-top: 12px; }
+  }
+  /* medium PC widths: the centred dock would cover the map buttons on the right */
+  @media (min-width: 900px) and (max-width: 1095px) {
+    .dock { right: 72px; }
   }
 
   /* ---------------------------------------------------------------- panel content */
@@ -448,7 +455,7 @@ $("mapModeBtn").onclick = () => {
 };
 $("simDriveBtn").onclick = async () => {
   const isSim = nav && nav.loc && nav.loc.source === "sim";
-  await post("/api/sim_drive", { action: isSim ? "stop" : "start", speed: 80 });
+  await post("/api/sim_drive", { action: isSim ? "stop" : "start", speed: 80 }, false, $("simDriveBtn"));
   follow = true;
   closeMenu();
   pollNav(true);
@@ -527,17 +534,35 @@ const navUrl = (lat, lon) => {
 function fmtKm(m) { return m == null ? "-" : m < 1000 ? `${Math.round(m / 10) * 10} ม.` : `${(m / 1000).toFixed(m < 10000 ? 1 : 0)} กม.`; }
 function fmtMin(s) { return s == null ? "" : ` · ~${Math.max(1, Math.round(s / 60))} นาที`; }
 
+// The nav poll runs every 0.8 s: rebuild the stop marker / route only when they really changed,
+// otherwise an open popup would close before the driver can read it.
+let stopSig = "", routeSig = "";
+function clearStopLayers(keepMarker) {
+  if (!keepMarker && nearestMarker) { map.removeLayer(nearestMarker); nearestMarker = null; stopSig = ""; }
+  if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
+  if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+  routeSig = "";
+}
 function renderStop() {
   const n = nav && nav.nearest ? nav.nearest[selType] : null;
   $("stopIcon").textContent = TYPE_ICON[selType];
-  if (nearestMarker) { map.removeLayer(nearestMarker); nearestMarker = null; }
-  if (nearestLine) { map.removeLayer(nearestLine); nearestLine = null; }
-  if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
-  const off = (txt, sub) => { $("stopName").textContent = txt; $("stopDist").textContent = sub;
+  const off = (txt, sub) => { clearStopLayers(false);
+                              $("stopName").textContent = txt; $("stopDist").textContent = sub;
                               $("go").setAttribute("aria-disabled", "true"); $("showRoute").disabled = true; };
   if (!nav || !nav.loc || nav.loc.lat == null) return off("ยังไม่รู้ตำแหน่งรถ", "รอสัญญาณ GPS…");
   if (!n) return off(`ไม่พบ${TYPE_NAME[selType]}ใกล้ ๆ`, "");
-  $("stopName").textContent = n.name || TYPE_NAME[selType];
+  const here = [nav.loc.lat, nav.loc.lon];
+  const routeKey = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
+  // apply a cached online road route BEFORE writing the distance text (no jump back to straight-line)
+  window._onlineRouteCache = window._onlineRouteCache || {};
+  if ((!n.route || n.route.length <= 1) && window._onlineRouteCache[routeKey]) {
+    const cached = window._onlineRouteCache[routeKey];
+    n.route = cached.route;
+    n.road_m = cached.road_m;
+    n.road_s = cached.road_s;
+  }
+  const name = n.name || TYPE_NAME[selType];
+  $("stopName").textContent = name;
   const where = (n.ahead === true ? " · ข้างหน้า" : n.ahead === false ? " · ด้านหลัง" : "")
     + (n.side === "same" ? " · ฝั่งเดียวกัน" : n.side === "opposite" ? " · ฝั่งตรงข้าม (ต้องกลับรถ)" : "");
   $("stopDist").innerHTML = n.road_m != null
@@ -547,19 +572,21 @@ function renderStop() {
       : `<b>${fmtKm(n.straight_m)}</b> เส้นตรง${where}`;
   $("go").href = navUrl(n.lat, n.lon);
   $("go").setAttribute("aria-disabled", "false"); $("showRoute").disabled = false;
-  nearestMarker = L.circleMarker([n.lat, n.lon], { radius: 12, color: "#fff", weight: 3, fillColor: TYPE_COLOR[selType], fillOpacity: 1 })
-    .bindPopup(`${TYPE_ICON[selType]} <b>${esc(n.name || TYPE_NAME[selType])}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
-    .addTo(map);
-  const here = [nav.loc.lat, nav.loc.lon];
-  const routeKey = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
-  window._onlineRouteCache = window._onlineRouteCache || {};
-  if ((!n.route || n.route.length <= 1) && window._onlineRouteCache[routeKey]) {
-    const cached = window._onlineRouteCache[routeKey];
-    n.route = cached.route;
-    n.road_m = cached.road_m;
-    n.road_s = cached.road_s;
+  // marker: rebuilt only when the stop itself changes (the popup's link uses the test origin too)
+  const sigM = [selType, n.lat, n.lon, name, nav.loc.source === "test" ? routeKey : ""].join("|");
+  if (sigM !== stopSig || !nearestMarker) {
+    clearStopLayers(false);
+    nearestMarker = L.circleMarker([n.lat, n.lon], { radius: 12, color: "#fff", weight: 3, fillColor: TYPE_COLOR[selType], fillOpacity: 1 })
+      .bindPopup(`${TYPE_ICON[selType]} <b>${esc(name)}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
+      .addTo(map);
+    stopSig = sigM;
   }
-  if (n.route && n.route.length > 1) {
+  const hasRoute = !!(n.route && n.route.length > 1);
+  const sigR = `${sigM}|${hasRoute ? n.route.length : 0}|${routeKey}`;
+  if (sigR === routeSig) return;          // nothing changed: keep the layers (and any open popup)
+  clearStopLayers(true);
+  routeSig = sigR;
+  if (hasRoute) {
     // road route like Google Maps: blue line with a dark casing, drawn under the markers
     const path = n.route;
     routeLine = L.layerGroup([
@@ -573,24 +600,27 @@ function renderStop() {
   } else {
     // no local road route (e.g. inside a small soi): draw dashed line now and try the online OSRM full-street route
     nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[selType], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
-    if (window._onlineRouteKey !== routeKey) {
+    if (window._onlineRouteKey !== routeKey && Date.now() >= (window._onlineRouteRetryAt || 0)) {
       window._onlineRouteKey = routeKey;
-      fetch(`https://router.project-osrm.org/route/v1/driving/${here[1]},${here[0]};${n.lon},${n.lat}?overview=full&geometries=geojson`)
+      const ctrl = new AbortController();
+      const tm = setTimeout(() => ctrl.abort(), 4000);      // no internet: give up quickly
+      fetch(`https://router.project-osrm.org/route/v1/driving/${here[1]},${here[0]};${n.lon},${n.lat}?overview=full&geometries=geojson`,
+            { signal: ctrl.signal })
         .then(r => r.json())
         .then(d => {
-          if (d.routes && d.routes[0]) {
-            const entry = {
-              route: d.routes[0].geometry.coordinates.map(c => [c[1], c[0]]),
-              road_m: Math.round(d.routes[0].distance),
-              road_s: Math.round(d.routes[0].duration),
-            };
-            window._onlineRouteCache[routeKey] = entry;
-            n.route = entry.route;
-            n.road_m = entry.road_m;
-            n.road_s = entry.road_s;
-            renderStop();
-          }
-        }).catch(() => {});
+          if (!(d.routes && d.routes[0])) throw new Error("no route");
+          const entry = {
+            route: d.routes[0].geometry.coordinates.map(c => [c[1], c[0]]),
+            road_m: Math.round(d.routes[0].distance),
+            road_s: Math.round(d.routes[0].duration),
+          };
+          window._onlineRouteCache[routeKey] = entry;
+          renderStop();
+        }).catch(() => {
+          // allow a retry later (not every 0.8 s while offline)
+          if (window._onlineRouteKey === routeKey) window._onlineRouteKey = null;
+          window._onlineRouteRetryAt = Date.now() + 15000;
+        }).finally(() => clearTimeout(tm));
     }
   }
 }
@@ -718,12 +748,12 @@ function openRestPicker() { restPickOpen = true; render(); }
 function closeRestPicker() { restPickOpen = false; render(); }
 // Rest: the driver picks 15/30/60 min -> the board pauses face checks and its speaker rings when
 // the time is up (until the driver sits in front of the camera or presses "ขับต่อ").
-async function startRest(minutes) {
+async function startRest(minutes, btn) {
   restPickOpen = false;
-  await post("/api/driver/rest", { action: "start", minutes });
+  await post("/api/driver/rest", { action: "start", minutes }, false, btn);
   pollOnce();
 }
-async function endRest() { await post("/api/driver/rest", { action: "end" }); pollOnce(); }
+async function endRest() { await post("/api/driver/rest", { action: "end" }, false, $("resumeDriveBtn")); pollOnce(); }
 const hhmm = (sec) => { const d = new Date(sec * 1000); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
 
 
@@ -735,7 +765,9 @@ function render() {
   $("title").textContent = `รถคันที่ ${d.truck}${drvTag ? " · " + drvTag : ""}`;
   updateDriverPreview();
   // real company-sync state from the board (not the phone's own "online" flag)
-  const synced = d.sync_ok_at != null && d.now - d.sync_ok_at < 30;
+  // an error after the last OK (e.g. events refused while heartbeats pass) = not synced
+  const errNewer = !!d.sync_err && (d.sync_err_at == null || d.sync_ok_at == null || d.sync_err_at >= d.sync_ok_at);
+  const synced = d.sync_ok_at != null && d.now - d.sync_ok_at < 30 && !errNewer;
   $("syncTxt").textContent = synced ? "ซิงก์บริษัทแล้ว" : "ยังส่งบริษัทไม่ได้ (เก็บในคิว)";
   $("syncPill").className = "chip " + (synced ? "good" : "warn");
   $("syncPill").title = $("syncTxt").textContent;
@@ -793,6 +825,7 @@ function render() {
 
   const on = !!d.shift_start; let breakDue = false;
   $("shiftOff").hidden = on; $("shiftOn").hidden = !on;
+  document.body.classList.toggle("no-shift", !on);     // phone: check-in visible without expanding the sheet
   if (on) {
     const since = d.now - (d.last_break || d.shift_start);
     breakDue = since >= d.break_every_s;
@@ -845,22 +878,38 @@ async function keepAwake() {
 }
 document.addEventListener("pointerdown", keepAwake);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) keepAwake(); });
-// send a button press to the board; one at a time per address (no double sends), tell the driver if it failed
+keepAwake();                                   // try at once too (may need a tap first; retried above)
+// send a button press to the board; one at a time per address (no double sends), tell the driver if it failed.
+// btn (optional): the pressed button, disabled while sending. quiet: automatic sends never pop up.
 const postBusy = new Set();
-async function post(url, body, quiet = false) {
+async function post(url, body, quiet = false, btn = null) {
   if (postBusy.has(url)) return false;
   postBusy.add(url);
+  if (btn) btn.disabled = true;
+  const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 5000);
   try {
-    const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 5000);
-    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
-    clearTimeout(tm);
-    if (!r.ok) throw new Error(String(r.status));
+    let r;
+    try {
+      r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
+    } catch (e) {
+      throw new Error("");                     // network / timeout: generic message below
+    }
+    let j = null;
+    try { j = await r.json(); } catch (e) {}
+    // some board endpoints answer HTTP 200 with {"ok": false, "error": "..."}
+    if (!r.ok || (j && j.ok === false)) {
+      const err = j && j.error ? String(j.error) : "HTTP " + r.status;
+      throw new Error("บอร์ดไม่รับคำสั่ง: " + err);
+    }
     return true;
   } catch (e) {
-    if (!quiet) alert("ส่งคำสั่งไปบอร์ดไม่สำเร็จ ลองกดอีกครั้ง (เช็กว่ามือถือยังต่อ Wi-Fi/ฮอตสปอตของบอร์ด)");
+    if (!quiet) alert(e && e.message ? e.message
+      : "ส่งคำสั่งไปบอร์ดไม่สำเร็จ ลองกดอีกครั้ง (เช็กว่ามือถือยังต่อ Wi-Fi/ฮอตสปอตของบอร์ด)");
     return false;
   } finally {
+    clearTimeout(tm);
     postBusy.delete(url);
+    if (btn) btn.disabled = false;
   }
 }
 $("startBtn").onclick = async () => {
@@ -870,14 +919,14 @@ $("startBtn").onclick = async () => {
   $("driverNameInput").value = code;
   driverProfile = code;
   store.set("ams_driver_code", code);
-  await post("/api/shift", { action: "start", driver_code: code });
+  await post("/api/shift", { action: "start", driver_code: code }, false, $("startBtn"));
   pollOnce();
 };
 $("breakBtn").onclick = openRestPicker;
-$("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { await post("/api/shift", { action: "end" }); pollOnce(); } };
-$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }); pollOnce(); };
+$("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { await post("/api/shift", { action: "end" }, false, $("endBtn")); pollOnce(); } };
+$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }, false, $("ackAwakeBtn")); pollOnce(); };
 $("ackBreakBtn").onclick = openRestPicker;         // picking a rest length also answers the alert
-document.querySelectorAll("#restPickBox [data-rest]").forEach((b) => { b.onclick = () => startRest(Number(b.dataset.rest)); });
+document.querySelectorAll("#restPickBox [data-rest]").forEach((b) => { b.onclick = () => startRest(Number(b.dataset.rest), b); });
 $("restPickCancel").onclick = closeRestPicker;
 $("resumeDriveBtn").onclick = endRest;
 // start: PC shows the side panel, phone starts with the small sheet (remember the last choice)
