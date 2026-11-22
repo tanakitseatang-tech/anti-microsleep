@@ -163,7 +163,9 @@
     body.panel-hidden .testnote { bottom: 76px; }      /* clear the "แสดงแผงข้อมูล" button */
     .card { padding: 12px; }
     input.text { min-height: 44px; }
-    .dock { top: calc(var(--bar-h) + var(--safe-t) + 4px); padding: 10px 12px; }
+    .dock { top: calc(var(--bar-h) + var(--safe-t) + 4px); left: calc(var(--side-w) + 10px); right: 72px;
+            padding: 10px 12px; transition: left .25s ease; }
+    body.panel-hidden .dock { left: 10px; }
     .dock .btn, .dock-btns.three .btn { min-height: 46px; font-size: 16px; }
   }
   @media (min-width: 900px) {
@@ -280,13 +282,9 @@
 </div>
 <div id="flash"></div>
 
-<!-- alert acknowledgement / rest timer: always visible above everything -->
-<section class="dock" id="ackBox" hidden role="alertdialog" aria-labelledby="ackTitle">
-  <div class="dock-title" id="ackTitle">⚠️ มีการแจ้งเตือนความง่วง</div>
-  <div class="dock-btns">
-    <button class="btn ok" id="ackAwakeBtn">✅ ฉันตื่นแล้ว</button>
-    <button class="btn" id="ackBreakBtn">☕ จอดพักรถแล้ว</button>
-  </div>
+<!-- hands-free alert banner: auto-clears once camera confirms driver is awake (green 5s) -->
+<section class="dock" id="ackBox" hidden role="alert" aria-labelledby="ackTitle">
+  <div class="dock-title" id="ackTitle" style="margin:0;text-align:center">🚨 ตรวจพบหลับใน!</div>
 </section>
 <!-- rest: pick how long, then the phone is the alarm clock -->
 <section class="dock" id="restPickBox" hidden role="dialog" aria-labelledby="restPickTitle">
@@ -506,7 +504,10 @@ $("recenter").classList.add("on");
 // padding so a fitted route is not hidden under the panel / status / dock
 function fitPadding() {
   const sheet = $("panel").getBoundingClientRect();
-  const bottom = !isDesktop() && panelMode() !== "hidden" ? Math.max(40, window.innerHeight - sheet.top + 20) : 40;
+  const isSideSheet = isDesktop() || window.matchMedia("(max-width: 899px) and (orientation: landscape) and (max-height: 520px)").matches;
+  const bottom = !isSideSheet && panelMode() !== "hidden" && sheet.top > window.innerHeight * 0.18
+    ? Math.max(40, Math.min(window.innerHeight - 160, window.innerHeight - sheet.top + 20))
+    : 40;
   return { paddingTopLeft: [30, 90], paddingBottomRight: [70, bottom] };
 }
 
@@ -823,9 +824,7 @@ function render() {
   $("restPickBox").hidden = !restPickOpen;
   $("ackBox").hidden = !needAck || restPickOpen || resting;
   $("ackBox").className = "dock " + (ackRed ? "red" : "warn");
-  $("ackTitle").textContent = ackRed
-    ? "🚨 แจ้งเตือนหลับใน! กดยืนยันเมื่อตื่นหรือแวะพักแล้ว"
-    : "⚠️ แจ้งเตือนความง่วง — กดยืนยันเมื่อตื่นดีแล้ว";
+  $("ackTitle").textContent = ackRed ? "🚨 ตรวจพบหลับใน!" : "⚠️ เตือนความง่วง";
   $("restTimerBox").hidden = !resting || restPickOpen;
   if (resting) {
     // board-measured time left (monotonic, immune to clock jumps); older app: board wall clock
@@ -963,8 +962,6 @@ $("startBtn").onclick = async () => {
 };
 $("breakBtn").onclick = openRestPicker;
 $("endBtn").onclick = async () => { if (confirm("จบกะตอนนี้?")) { await post("/api/shift", { action: "end" }, false, $("endBtn")); pollOnce(); } };
-$("ackAwakeBtn").onclick = async () => { await post("/api/driver/ack", { kind: "awake" }, false, $("ackAwakeBtn")); pollOnce(); };
-$("ackBreakBtn").onclick = openRestPicker;         // picking a rest length also answers the alert
 document.querySelectorAll("#restPickBox [data-rest]").forEach((b) => { b.onclick = () => startRest(Number(b.dataset.rest), b); });
 $("restPickCancel").onclick = closeRestPicker;
 $("resumeDriveBtn").onclick = endRest;
