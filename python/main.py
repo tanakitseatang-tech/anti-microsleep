@@ -99,7 +99,7 @@ YAW_POSE_MAX = 0.75           # with the head dropped/back/tilted, eyes are stil
 HEAD_WARN_S = 2.0             # head down / tilted this long -> WARNING
 HEAD_ALARM_S = 5.0            # head down / tilted this long -> ALARM (nodding off)
 DROP_WARN_S = 1.0             # face vanished right after the head went down -> WARNING
-DROP_ALARM_S = 3.0            # ... and is still gone after this long -> ALARM
+DROP_ALARM_S = 2.0            # ... and is still gone after this long -> ALARM
 PERSON_EVERY_S = 0.5          # person detector (YOLOX) runs only while no face is seen
 PERSON_MIN_CONF = 0.45
 PERSON_MIN_AREA = 0.15        # person box >= 15 % of the frame = sitting right in front
@@ -119,7 +119,7 @@ HAAR_RELIABLE = 0.75          # detector must find this driver's open eyes >= 75
 HAAR_LEARN_EVERY_S = 0.3
 HAAR_DOUBT_RATIO = 0.88       # EAR below baseline*0.88 (and not clearly shut) -> ask the detector
 LOOK_AWAY_WARN_S = 4.0        # head turned away this long -> WARNING (distraction)
-LOOK_AWAY_ALARM_S = 10.0      # ... this long -> ALARM (eyes off the road far too long, or asleep turned)
+LOOK_AWAY_ALARM_S = 6.0       # ... this long -> ALARM (eyes off the road >= 6 s, ~133 m blind at 80 km/h)
 NO_FACE_WARN_S = 4.0         # good light but no face this long -> WARNING
 LOW_LIGHT_BRIGHTNESS = 35     # mean gray level below this = camera "blind"
 
@@ -331,6 +331,7 @@ class DrowsinessDetector:
         self.recent_face = deque()          # (t, pitch, face centre y / frame h), last 2 s
         self.last_head_down = False
         self.dropped = False                # face vanished downward = head dropped
+        self.turned_away = False            # face vanished sideways (checking mirrors / changing lane)
         self.base_pitch = self.base_roll = None
         self.yaw_samples = deque()          # (t, raw yaw) all face frames, last 2 min
         self.base_yaw = 0.0                 # driver's normal yaw (camera off-centre)
@@ -491,6 +492,7 @@ class DrowsinessDetector:
             s["pitch"], s["roll"] = pitch, roll
             # remember the last 2 s of head motion, to judge a disappearing face
             self.dropped = False
+            self.turned_away = False
             self.recent_face.append((t, pitch, float(pts[:, 1].mean()) / fh))
             while self.recent_face and t - self.recent_face[0][0] > 2.0:
                 self.recent_face.popleft()
@@ -662,10 +664,10 @@ class DrowsinessDetector:
             else:
                 self.yawn_since = None
         else:
+            was_away = self.away_since
             self.closed_since = None
             self.ear_closed_since = None
             self.yawn_since = None
-            self.away_since = None
             self.head_since = None
             self.narrow_since = None
             self.ear_buf.clear()
@@ -680,13 +682,21 @@ class DrowsinessDetector:
                     slide = rf[-1][2] - min(c for _, _, c in rf)
                     self.dropped = (self.last_head_down or rise >= DROP_PITCH_RISE
                                     or slide >= DROP_FACE_SLIDE)
-                    if self.dropped:
-                        logger.info(f"Face lost while dropping (pitch +{rise:.0f} deg, "
-                                    f"slide {slide:.2f}) -> head-drop watch")
+                last_yaw = abs(self.yaw_buf[-1]) if self.yaw_buf else 0.0
+                self.turned_away = (not self.dropped) and (was_away is not None or last_yaw >= YAW_MAX)
+                if self.dropped:
+                    logger.info("Face lost while dropping -> head-drop watch")
+                elif self.turned_away:
+                    logger.info(f"Face lost while turning sideways (yaw {last_yaw:.2f}) -> look-away timer continues")
                 self.recent_face.clear()
             elif self.calibrated and t - self.no_face_since >= NEW_DRIVER_NO_FACE_S:
                 self.forget_driver()
                 logger.info("No face for 30 s: forgetting learned eyes (driver may change)")
+            # Keep away_since ticking continuously across side-profile face flickers!
+            if self.turned_away:
+                self.away_since = was_away if was_away is not None else self.no_face_since
+            else:
+                self.away_since = None
 
         # --- short window: share of closed frames in the last 2 s (flicker-proof) ---
         while self.recent_closed and t - self.recent_closed[0][0] > CLOSED_WINDOW_S:
@@ -737,12 +747,16 @@ class DrowsinessDetector:
             r.append(f"PERCLOS {p:.0%}" + (" (very drowsy)" if p >= PERCLOS_ALARM else ""))
         if s["yawns"] >= YAWNS_WARN:
             lvl = max(lvl, 1); r.append(f"{s['yawns']} yawns/5min")
-        if light_ok and self.no_face_since is not None and s["t"] - self.no_face_since >= NO_FACE_WARN_S:
+        if self.turned_away and self.no_face_since is not None:
+            dur = s["t"] - self.no_face_since
+            if dur >= LOOK_AWAY_ALARM_S:
+                lvl = 2; r.append(f"looking away {dur:.0f}s")
+        elif light_ok and self.no_face_since is not None and s["t"] - self.no_face_since >= NO_FACE_WARN_S:
             lvl = max(lvl, 1); r.append("face not visible")
         hidden = (self.no_face_since is not None and person_checker is not None
                   and person_checker.present_now(s["t"]))
         s["person_no_face"] = hidden
-        if hidden and not self.dropped:
+        if hidden and not self.dropped and not self.turned_away:
             self.dropped = True                     # person in front, face hidden = head down
             logger.info("Person in front of camera but no face -> head-down watch")
         if self.dropped and self.no_face_since is not None:
@@ -2148,6 +2162,20 @@ class CompanySync:
         loc = _company_location()
         st = live.stats
         ru = driver_log.rest_until
+        # Rest end for the company, from the clock-jump-proof time left (rest_left uses a monotonic
+        # deadline within one boot). Keep the sent value STABLE: the website treats any change of
+        # rest_until as a new rest (resets its once-per-rest LINE flag), so only move it when the
+        # real end moved by more than 30 s (NTP jump / new rest).
+        if ru:
+            left = driver_log.rest_left()
+            want = round(time.time() + self.clock_offset + left) if left is not None else round(ru + self.clock_offset)
+            prev = getattr(self, "_sent_rest_until", None)
+            if prev is None or abs(want - prev) > 30:
+                self._sent_rest_until = want
+            ru_out = self._sent_rest_until
+        else:
+            self._sent_rest_until = None
+            ru_out = None
         hb = {
             "lat": loc.get("lat"),
             "lon": loc.get("lon"),
@@ -2156,7 +2184,7 @@ class CompanySync:
             "camera_ok": st.get("status") != "NO_CAMERA",
             "version": APP_VERSION,
             # resting until (epoch s) or None; the company site sends LINE if the rest runs 15 min over
-            "rest_until": round(ru + self.clock_offset) if ru else None,
+            "rest_until": ru_out,
             # demo highway drive is on: the company site labels this truck "simulated"
             "sim": loc.get("source") == "sim",
         }
@@ -2398,6 +2426,24 @@ def loop():
             eye_model.submit(frame, pts, t, urgent=detector.ear_closed_since is not None,
                              ear=detector.ear_buf[-1] if detector.ear_buf else None)
         s = detector.update(pts, frame, t)
+
+    # Hands-free Auto-ACK: if an alert is pending and the driver stays GREEN (level == 0,
+    # face visible, eyes open) for 5 continuous seconds, confirm awake automatically (no phone tap).
+    if driver_log.pending_alert_at is not None and rest is None:
+        if s["level"] == 0 and pts is not None and not s["eyes_closed"]:
+            if getattr(loop, "_auto_awake_since", None) is None:
+                loop._auto_awake_since = t
+            elif t - loop._auto_awake_since >= 5.0:
+                sec = driver_log.ack()
+                loop._auto_awake_since = None
+                if sec is not None:
+                    note = f"คนขับกลับมาตื่นแล้ว (ยืนยันอัตโนมัติด้วยกล้องใน {sec} วิ)"
+                    company_sync.enqueue_ack(note)
+                    logger.info(f"Auto-ACK by camera: {note}")
+        else:
+            loop._auto_awake_since = None
+    else:
+        loop._auto_awake_since = None
 
     # Rest time is up: the alarm stops only when the driver is in front of the camera with eyes
     # OPEN for REST_AWAKE_S (a driver asleep in the seat also shows a face) or presses "ขับต่อ".
