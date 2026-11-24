@@ -68,8 +68,10 @@ EYES_CLOSED_WARN_S = 1.0      # eyes closed this long -> WARNING
 EYES_CLOSED_ALARM_S = 2.0     # eyes closed this long -> ALARM (microsleep)
 SQUINT_CLOSED_WARN_S = 1.5    # closure seen only as "narrow + no iris" (glasses / squint):
 SQUINT_CLOSED_ALARM_S = 3.0   # ...warn / alarm a bit later, so a squint is not a microsleep
-SQUINT_EXCUSE_MAX_S = 8.0     # a closure that looks like a hard squint (squint_check.py) is excused
+SQUINT_EXCUSE_MAX_S = 8.0   # a closure that looks like a hard squint (squint_check.py) is excused
                               # this long at most; after that it counts as closed again (safety net)
+SQUINT_EXCUSE_RESET_S = 0.5   # the excuse timer restarts only after the eyes look open this long
+                              # (iris/EAR flicker during one closure must not restart it)
 REOPEN_MARGIN = 1.00          # a closure ends only when EAR rises above the squint threshold
 HOLD_AFTER_S = 0.5            # closures longer than this also ride over short "open" flickers
 REOPEN_GRACE_S = 0.3          # ...eyes must look open this long to end the closure
@@ -124,6 +126,8 @@ NO_FACE_WARN_S = 4.0         # good light but no face this long -> WARNING
 LOW_LIGHT_BRIGHTNESS = 35     # mean gray level below this = camera "blind"
 
 LEVEL_HOLD_S = 1.5            # keep an alarm at least this long (no flicker)
+AUTO_ACK_S = 5.0              # driver awake this long after an alert -> alert card clears by itself
+AUTO_ACK_GRACE_S = 0.6        # a blink / face lost shorter than this does not restart that timer
 HEARTBEAT_S = 1.0             # resend state to MCU at least this often
 
 # Status codes shown on the MCU (LED4 colour)
@@ -347,6 +351,7 @@ class DrowsinessDetector:
         self.ear_closed_since = None        # closure according to EAR only
         self.reopen_since = None            # eyes look open again since (hysteresis)
         self.squint_face_since = None       # closure excused as a hard squint since
+        self.sq_open_since = None           # eyes look open since (ends the squint excuse)
         self.ep_min_ear = None              # lowest EAR in the current closure
         self.haar_open = deque(maxlen=60)   # open-eye detector results on clearly open eyes
         self.haar_learn_t = 0.0
@@ -575,6 +580,7 @@ class DrowsinessDetector:
                             logger.warning(f"squint check error: {e}")
                         s["sq_info"] = sq_info
                 if sq_face:
+                    self.sq_open_since = None
                     if self.squint_face_since is None:
                         self.squint_face_since = t
                         logger.info(f"Hard squint, not closed: {s.get('sq_info')}")
@@ -583,8 +589,16 @@ class DrowsinessDetector:
                         s["squint"] = True
                     else:
                         sq_face = False                           # too long: count as closed
-                else:
-                    self.squint_face_since = None
+                elif self.squint_face_since is not None:
+                    # keep the excuse clock running through flicker; reset only once the
+                    # eyes have looked clearly open for SQUINT_EXCUSE_RESET_S
+                    if ear >= self.squint_threshold:
+                        if self.sq_open_since is None:
+                            self.sq_open_since = t
+                        if t - self.sq_open_since >= SQUINT_EXCUSE_RESET_S:
+                            self.squint_face_since, self.sq_open_since = None, None
+                    else:
+                        self.sq_open_since = None
                 # Hysteresis: once the eyes are closed they count as closed until they clearly
                 # reopen. Glasses make EAR / iris flicker around the squint edge, which used to
                 # reset the timer every few frames so the alarm never came.
@@ -776,6 +790,9 @@ class DrowsinessDetector:
                     "head back" if s.get("head_back") else "head tilted")
             if dur >= HEAD_EYES_MIN_S and cf is not None and cf >= HEAD_EYES_FRAC:
                 lvl = 2; r.append(f"{what} + eyes closed")          # nodding off
+            elif what == "head back" and not s.get("head_tilt"):
+                pass    # leaning back in the seat with eyes open is a normal driving posture:
+                        # it only counts when the eyes close too (branch above)
             elif dur >= HEAD_ALARM_S:
                 lvl = 2; r.append(f"{what} {dur:.0f}s")
             elif dur >= HEAD_WARN_S:
@@ -1552,7 +1569,7 @@ EVENTS_FILE = os.path.join(DATA_DIR, "events.jsonl")
 SHIFT_FILE = os.path.join(DATA_DIR, "shift.json")
 DRIVERS_CACHE_FILE = os.path.join(DATA_DIR, "drivers.json")
 EVENTS_KEEP = 500             # newest events kept in memory / served to the page
-BREAK_EVERY_S = 2 * 3600      # remind the driver to rest after 2 h of driving
+BREAK_EVERY_S = 4 * 3600      # remind the driver to rest (>= 30 min) after 4 h of driving
 
 
 def _norm_driver_code(raw):
@@ -2331,6 +2348,17 @@ def open_camera():
     logger.warning(f"No camera yet ({last_err}). Retrying in 5 s...")
 
 
+def _awake_now(s, pts):
+    """Driver looks awake on THIS frame: face seen, eyes not held shut, head up, eyes on the road,
+    no ALARM. History-based warnings (PERCLOS, yawns) are ignored on purpose: they say "tired
+    lately", not "asleep now", and stay on the status card anyway."""
+    return (pts is not None
+            and s.get("level", 0) < 2
+            and s.get("closed_for", 0.0) < EYES_CLOSED_WARN_S
+            and not (s.get("head_down") or s.get("head_tilt"))   # leaning back with open eyes = awake
+            and not s.get("looking_away"))
+
+
 def loop():
     global camera, next_camera_try, last_log, frames, last_level, current_fps, system_started, learning_said, was_calibrated
     global no_driver_since, no_driver_voiced, no_driver_reported, was_resting
@@ -2427,13 +2455,17 @@ def loop():
                              ear=detector.ear_buf[-1] if detector.ear_buf else None)
         s = detector.update(pts, frame, t)
 
-    # Hands-free Auto-ACK: if an alert is pending and the driver stays GREEN (level == 0,
-    # face visible, eyes open) for 5 continuous seconds, confirm awake automatically (no phone tap).
+    # Hands-free Auto-ACK: if an alert is pending and the driver is AWAKE RIGHT NOW (face visible,
+    # eyes open, head up, looking at the road, no alarm) for AUTO_ACK_S, confirm awake automatically.
+    # Not "level == 0": PERCLOS (60 s look-back) and yawns (5 min) keep a yellow WARNING on long
+    # after the driver is awake, so the "ตรวจพบหลับใน!" card never cleared. Normal blinks and a
+    # face lost for a few frames are tolerated, so the timer is not restarted every few seconds.
     if driver_log.pending_alert_at is not None and rest is None:
-        if s["level"] == 0 and pts is not None and not s["eyes_closed"]:
+        if _awake_now(s, pts):
+            loop._auto_bad_at = None
             if getattr(loop, "_auto_awake_since", None) is None:
                 loop._auto_awake_since = t
-            elif t - loop._auto_awake_since >= 5.0:
+            elif t - loop._auto_awake_since >= AUTO_ACK_S:
                 sec = driver_log.ack()
                 loop._auto_awake_since = None
                 if sec is not None:
@@ -2441,9 +2473,13 @@ def loop():
                     company_sync.enqueue_ack(note)
                     logger.info(f"Auto-ACK by camera: {note}")
         else:
-            loop._auto_awake_since = None
+            if getattr(loop, "_auto_bad_at", None) is None:
+                loop._auto_bad_at = t
+            if t - loop._auto_bad_at >= AUTO_ACK_GRACE_S or s["level"] == 2:
+                loop._auto_awake_since = None
     else:
         loop._auto_awake_since = None
+        loop._auto_bad_at = None
 
     # Rest time is up: the alarm stops only when the driver is in front of the camera with eyes
     # OPEN for REST_AWAKE_S (a driver asleep in the seat also shows a face) or presses "ขับต่อ".

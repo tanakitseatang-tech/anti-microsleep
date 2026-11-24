@@ -187,7 +187,7 @@
   /* ---------------------------------------------------------------- panel content */
   .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; margin-bottom: 12px; }
   .card h3 { margin: 0 0 10px; font-size: 14px; color: var(--muted); font-weight: 700; display: flex; align-items: center; gap: 8px; }
-  .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; border-radius: 14px; background: var(--bg);
+  .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 4px; border-radius: 14px; background: var(--bg);
          border: 1px solid var(--line); margin-bottom: 12px; }
   .seg button { min-height: 42px; border: 0; border-radius: 10px; background: transparent; color: var(--muted); font-weight: 700;
                 font-size: 14px; cursor: pointer; }
@@ -317,7 +317,8 @@
     <div class="rest-msg" id="restMsg" hidden></div>
 
     <div class="seg" role="tablist" aria-label="ประเภทจุดแวะ">
-      <button class="on" data-type="fuel" role="tab">⛽ ปั๊ม</button>
+      <button class="on" data-type="all" role="tab">📍 ใกล้สุด</button>
+      <button data-type="fuel" role="tab">⛽ ปั๊ม</button>
       <button data-type="rest_area" role="tab">🅿️ จุดพัก</button>
       <button data-type="cafe" role="tab">☕ กาแฟ</button>
     </div>
@@ -525,7 +526,7 @@ function loadPois() {
       poiLayer.clearLayers();
       for (const [lat, lon, k, name] of d.pois || []) {
         const t = TYPES[k];
-        if (t !== selType) continue;                 // only the selected kind of stop
+        if (selType !== "all" && t !== selType) continue;   // only the selected kind of stop
         L.circleMarker([lat, lon], { radius: 7, color: "#0d1014", weight: 2, fillColor: TYPE_COLOR[t], fillOpacity: 1 })
           .bindPopup(`${TYPE_ICON[t]} <b>${esc(name || TYPE_NAME[t])}</b><br><a target="_blank" rel="noopener" href="${navUrl(lat, lon)}">🧭 นำทาง</a>`)
           .addTo(poiLayer);
@@ -544,7 +545,7 @@ map.on("contextmenu", async (e) => {
 });
 
 // nearest-stop highlight
-let selType = "fuel", nav = null, nearestMarker = null, nearestLine = null, routeLine = null, userPicked = false;
+let selType = "all", nav = null, nearestMarker = null, nearestLine = null, routeLine = null, userPicked = false;
 function selectType(t) {
   selType = t;
   document.querySelectorAll(".seg button").forEach(x => { x.classList.toggle("on", x.dataset.type === t); x.setAttribute("aria-selected", x.dataset.type === t); });
@@ -572,14 +573,29 @@ function clearStopLayers(keepMarker) {
   if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
   routeSig = "";
 }
+// "ใกล้สุด" tab: the closest of the board's nearest fuel / rest area / cafe, ranked the way
+// nav.py ranks stops (road distance if known, behind the truck x2.5, opposite side +1 km).
+function curStop() {
+  const all = nav && nav.nearest ? nav.nearest : null;
+  if (selType !== "all") return { n: all ? all[selType] || null : null, t: selType };
+  let best = null, bt = null, bk = Infinity;
+  for (const t of TYPES) {
+    const c = all && all[t];
+    if (!c) continue;
+    const base = c.road_m != null ? c.road_m : (c.straight_m || 0) * (c.off_road ? 1.4 : 1);
+    const k = base * (c.ahead === false ? 2.5 : 1) + (c.side === "opposite" ? 1000 : 0);
+    if (k < bk) { bk = k; best = c; bt = t; }
+  }
+  return { n: best, t: bt };
+}
 function renderStop() {
-  const n = nav && nav.nearest ? nav.nearest[selType] : null;
-  $("stopIcon").textContent = TYPE_ICON[selType];
+  const { n, t } = curStop();
+  $("stopIcon").textContent = t ? TYPE_ICON[t] : "📍";
   const off = (txt, sub) => { clearStopLayers(false);
                               $("stopName").textContent = txt; $("stopDist").textContent = sub;
                               $("go").setAttribute("aria-disabled", "true"); $("showRoute").disabled = true; };
   if (!nav || !nav.loc || nav.loc.lat == null) return off("ยังไม่รู้ตำแหน่งรถ", "รอสัญญาณ GPS…");
-  if (!n) return off(`ไม่พบ${TYPE_NAME[selType]}ใกล้ ๆ`, "");
+  if (!n) return off(`ไม่พบ${selType === "all" ? "จุดแวะพัก" : TYPE_NAME[selType]}ใกล้ ๆ`, "");
   const here = [nav.loc.lat, nav.loc.lon];
   const routeKey = `${here[0].toFixed(4)},${here[1].toFixed(4)};${n.lat.toFixed(4)},${n.lon.toFixed(4)}`;
   // apply a cached online road route BEFORE writing the distance text (no jump back to straight-line)
@@ -590,9 +606,10 @@ function renderStop() {
     n.road_m = cached.road_m;
     n.road_s = cached.road_s;
   }
-  const name = n.name || TYPE_NAME[selType];
+  const name = n.name || TYPE_NAME[t];
   $("stopName").textContent = name;
-  const where = (n.ahead === true ? " · ข้างหน้า" : n.ahead === false ? " · ด้านหลัง" : "")
+  const where = (selType === "all" && n.name ? ` · ${TYPE_NAME[t]}` : "")
+    + (n.ahead === true ? " · ข้างหน้า" : n.ahead === false ? " · ด้านหลัง" : "")
     + (n.side === "same" ? " · ฝั่งเดียวกัน" : n.side === "opposite" ? " · ฝั่งตรงข้าม (ต้องกลับรถ)" : "");
   $("stopDist").innerHTML = n.road_m != null
     ? `<b>${fmtKm(n.road_m)}</b> ตามถนน${fmtMin(n.road_s)}${where}`
@@ -602,11 +619,11 @@ function renderStop() {
   $("go").href = navUrl(n.lat, n.lon);
   $("go").setAttribute("aria-disabled", "false"); $("showRoute").disabled = false;
   // marker: rebuilt only when the stop itself changes (the popup's link uses the test origin too)
-  const sigM = [selType, n.lat, n.lon, name, nav.loc.source === "test" ? routeKey : ""].join("|");
+  const sigM = [selType, t, n.lat, n.lon, name, nav.loc.source === "test" ? routeKey : ""].join("|");
   if (sigM !== stopSig || !nearestMarker) {
     clearStopLayers(false);
-    nearestMarker = L.circleMarker([n.lat, n.lon], { radius: 12, color: "#fff", weight: 3, fillColor: TYPE_COLOR[selType], fillOpacity: 1 })
-      .bindPopup(`${TYPE_ICON[selType]} <b>${esc(name)}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
+    nearestMarker = L.circleMarker([n.lat, n.lon], { radius: 12, color: "#fff", weight: 3, fillColor: TYPE_COLOR[t], fillOpacity: 1 })
+      .bindPopup(`${TYPE_ICON[t]} <b>${esc(name)}</b><br><a target="_blank" rel="noopener" href="${navUrl(n.lat, n.lon)}">🧭 นำทาง</a>`)
       .addTo(map);
     stopSig = sigM;
   }
@@ -628,7 +645,7 @@ function renderStop() {
     nearestMarker.bringToFront();
   } else {
     // no local road route (e.g. inside a small soi): draw dashed line now and try the online OSRM full-street route
-    nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[selType], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
+    nearestLine = L.polyline([here, [n.lat, n.lon]], { color: TYPE_COLOR[t], weight: 3, dashArray: "6 8", opacity: .9 }).addTo(map);
     if (window._onlineRouteKey !== routeKey && Date.now() >= (window._onlineRouteRetryAt || 0)) {
       window._onlineRouteKey = routeKey;
       const ctrl = new AbortController();
@@ -655,7 +672,7 @@ function renderStop() {
 }
 
 function showRoute() {
-  const n = nav && nav.nearest ? nav.nearest[selType] : null;
+  const { n } = curStop();
   if (!n || !nav || !nav.loc || nav.loc.lat == null) return;
   follow = false; $("recenter").classList.remove("on");
   if (!isDesktop() && panelMode() === "open") setPanel("peek");
@@ -866,20 +883,26 @@ function render() {
     const since = d.now - (d.last_break || d.shift_start);
     breakDue = since >= d.break_every_s;
     $("drive").textContent = fmtDur(since);
-    $("shiftSub").textContent = (drvTag ? `👤 ${drvTag} · ` : "") + (breakDue ? "⚠️ ขับนานแล้ว ควรพัก 15 นาที" : `เริ่มกะ ${fmtClock(d.shift_start)} · ควรพักทุก ${d.break_every_s / 3600} ชม.`);
+    $("shiftSub").textContent = (drvTag ? `👤 ${drvTag} · ` : "") + (breakDue ? "⚠️ ขับครบ 4 ชม. แล้ว ควรพักอย่างน้อย 30 นาที" : `เริ่มกะ ${fmtClock(d.shift_start)} · ควรพักทุก ${d.break_every_s / 3600} ชม.`);
     $("meter").style.width = Math.min(100, since / d.break_every_s * 100) + "%";
     $("meter").className = breakDue ? "due" : "";
+    // rest30: after 4 h the rest must be at least 30 min -> hide the 15-min choice
+    document.querySelector('#restPickBox [data-rest="15"]').hidden = breakDue;
   }
 
   // tired -> suggest a rest stop and switch the card to rest areas (unless the driver picked a tab)
   const recent = (sec) => evs.filter(e => d.now - e.t <= sec);
-  const red = d.level === 2 || recent(900).some(e => e.level === 2);
-  const many = recent(3600).length >= 3;
-  const show = red || many || breakDue;
+  // only while the driver is drowsy now / the alert is not cleared yet (camera auto-clears it
+  // once the driver is awake), or a break is due - not for 15 min after every alert
+  const alertNow = d.level > 0 || !!d.pending_alert_at;
+  const red = d.level === 2 || (!!d.pending_alert_at && d.pending_level === 2);
+  const many = alertNow && recent(3600).length >= 3;
+  const show = red || many || breakDue || alertNow;
   $("restMsg").hidden = !show;
   $("restMsg").className = "rest-msg" + (red ? " red" : "");
-  $("restMsg").textContent = red ? "😴 คุณหลับใน! แวะพักที่ใกล้ที่สุดก่อนนะ" : many ? "😴 คุณเริ่มง่วงบ่อยแล้ว แวะพักก่อนนะ" : "⏰ ขับนานแล้ว ถึงเวลาพัก";
-  if (show && !userPicked && selType !== "rest_area" && nav && nav.nearest && nav.nearest.rest_area) selectType("rest_area");
+  $("restMsg").textContent = red ? "😴 คุณหลับใน! แวะพักที่ใกล้ที่สุดก่อนนะ" : many ? "😴 คุณเริ่มง่วงบ่อยแล้ว แวะพักก่อนนะ" : "⏰ ขับครบ 4 ชม. แล้ว พักอย่างน้อย 30 นาทีก่อนนะ";
+  // drowsy: the closest stop of ANY kind is safer than driving on to a farther rest area
+  if (show && !userPicked && selType !== "all") selectType("all");
 }
 
 async function pollOnce() {
